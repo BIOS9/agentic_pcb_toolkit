@@ -1,7 +1,7 @@
 # CR-003 — Open-source toolchain only
 
 Raised: 2026-08-29. Source: [#2](https://github.com/BIOS9/agentic_pcb_toolkit/issues/2).
-Status: proposed.
+Status: **accepted** 2026-08-29.
 
 ## Problem
 

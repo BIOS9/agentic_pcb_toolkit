@@ -1,7 +1,7 @@
 # CR-005 — Build artifacts do not belong in git
 
 Raised: 2026-08-29. Source: [#4](https://github.com/BIOS9/agentic_pcb_toolkit/issues/4).
-Status: proposed.
+Status: **accepted** 2026-08-29.
 
 ## Problem
 

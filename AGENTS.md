@@ -89,6 +89,28 @@ Concretely:
 Per-agent behaviour *evals* are the deliberate exception: evaluating how an
 agent behaves is necessarily agent-specific. See CR-001.
 
+### 8. Open-source software only
+
+Everything in the path from requirements to fab output must be open source, so
+a design stays maintainable for as long as the board exists. Before adding any
+dependency, check its licence; absence of a stated licence is rejection, not
+permission. Fab output uses published formats (Gerber X2, Excellon, IPC-2581,
+ODB++) — a vendor package is an *arrangement* of those, never a private format.
+
+Vendor part data (LCSC, EasyEDA) is an input, not a dependency: it may enrich a
+build, never gate one. See [CR-003](docs/sdlc/CR-003-open-source-only/).
+
+### 9. Build artifacts never go in git
+
+If it can be regenerated deterministically from this repository, it does not
+belong in a commit — Gerbers, PDFs, renders, Nix results, `findings/`,
+`release/`. Vendored inputs are *not* regenerable from the repo and are
+committed; so are fingerprints (hashes, lockfiles), which are what make
+committing the artifacts unnecessary.
+
+Run output goes to CI artifact storage, released output to a GitHub Release.
+See [CR-005](docs/sdlc/CR-005-no-build-artifacts/).
+
 ## Layout
 
 - `pcbkit/core/` — pure functions. No argv, no stdout, no `sys.exit`.

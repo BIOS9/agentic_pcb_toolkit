@@ -1,7 +1,7 @@
 # CR-002 — Requirements, not source code, are the entry point
 
 Raised: 2026-08-29. Source: [#1](https://github.com/BIOS9/agentic_pcb_toolkit/issues/1).
-Status: proposed.
+Status: **accepted** 2026-08-29.
 
 ## Problem
 

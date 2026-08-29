@@ -56,10 +56,10 @@ pcbkit may be agent-specific; pcbkit itself may not be.
 | [M1](M1/) | shipped | Circuit IR and capture DSL |
 | [M3](M3/spike.md) | spike done | `kicad-sch-api` writes KiCad 10 schematics |
 | [CR-001](CR-001-agent-neutral/) | accepted | No agent may be privileged |
-| [CR-002](CR-002-iterative-intent/) | proposed | Requirements are the entry point ([#1](https://github.com/BIOS9/agentic_pcb_toolkit/issues/1)) |
-| [CR-003](CR-003-open-source-only/) | proposed | Open-source toolchain only ([#2](https://github.com/BIOS9/agentic_pcb_toolkit/issues/2)) |
-| [CR-004](CR-004-reproducible-builds/) | proposed | Hermetic, reproducible builds ([#3](https://github.com/BIOS9/agentic_pcb_toolkit/issues/3)) |
-| [CR-005](CR-005-no-build-artifacts/) | proposed | Build artifacts do not belong in git ([#4](https://github.com/BIOS9/agentic_pcb_toolkit/issues/4)) |
+| [CR-002](CR-002-iterative-intent/) | accepted | Requirements are the entry point ([#1](https://github.com/BIOS9/agentic_pcb_toolkit/issues/1)) |
+| [CR-003](CR-003-open-source-only/) | accepted | Open-source toolchain only ([#2](https://github.com/BIOS9/agentic_pcb_toolkit/issues/2)) |
+| [CR-004](CR-004-reproducible-builds/) | accepted | Hermetic, reproducible builds ([#3](https://github.com/BIOS9/agentic_pcb_toolkit/issues/3)) |
+| [CR-005](CR-005-no-build-artifacts/) | accepted | Build artifacts do not belong in git ([#4](https://github.com/BIOS9/agentic_pcb_toolkit/issues/4)) |
 
 The approved implementation plan for M0-M7 lives outside the repo at
 `~/.claude/plans/i-want-to-build-zany-firefly.md`. CR-002, CR-004, and CR-005

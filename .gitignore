@@ -4,5 +4,8 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+# CR-005: generated per-project output. Excluded before anything writes here.
+findings/
+release/
 *.egg-info/
 .pcbkit-cache/
