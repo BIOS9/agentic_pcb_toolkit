@@ -64,6 +64,7 @@ pcbkit may be agent-specific; pcbkit itself may not be.
 | [CR-005](CR-005-no-build-artifacts/) | accepted | Build artifacts do not belong in git ([#4](https://github.com/BIOS9/agentic_pcb_toolkit/issues/4)) |
 | [CR-006](CR-006-fab-capabilities-as-drc/) | accepted | Manufacturing capabilities are design constraints ([#5](https://github.com/BIOS9/agentic_pcb_toolkit/issues/5)) |
 | [CR-007](CR-007-jlcpcb-assembly-default/) | accepted | Assembled JLCPCB order is the default target ([#6](https://github.com/BIOS9/agentic_pcb_toolkit/issues/6)) |
+| [CR-008](CR-008-pull-request-workflow/) | proposed | Changes land through reviewed pull requests ([#7](https://github.com/BIOS9/agentic_pcb_toolkit/issues/7)) |
 
 ## The plan
 
