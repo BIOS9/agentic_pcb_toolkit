@@ -59,7 +59,14 @@ pcbkit may be agent-specific; pcbkit itself may not be.
 | [CR-002](CR-002-iterative-intent/) | proposed | Requirements are the entry point ([#1](https://github.com/BIOS9/agentic_pcb_toolkit/issues/1)) |
 | [CR-003](CR-003-open-source-only/) | proposed | Open-source toolchain only ([#2](https://github.com/BIOS9/agentic_pcb_toolkit/issues/2)) |
 | [CR-004](CR-004-reproducible-builds/) | proposed | Hermetic, reproducible builds ([#3](https://github.com/BIOS9/agentic_pcb_toolkit/issues/3)) |
+| [CR-005](CR-005-no-build-artifacts/) | proposed | Build artifacts do not belong in git ([#4](https://github.com/BIOS9/agentic_pcb_toolkit/issues/4)) |
 
 The approved implementation plan for M0-M7 lives outside the repo at
-`~/.claude/plans/i-want-to-build-zany-firefly.md`. CR-002 and CR-004 both change
-it; see their spec files for what they supersede.
+`~/.claude/plans/i-want-to-build-zany-firefly.md`. CR-002, CR-004, and CR-005
+all change it; see their spec files for what they supersede.
+
+Several of these depend on each other. CR-005 relies on CR-004, because
+"regenerable, so do not commit it" is only a safe standard once regeneration is
+actually deterministic. CR-003 and CR-004 are two halves of one durability
+argument. CR-002 defines what the fab gate is for; CR-005 defines how its
+approval is recorded.
