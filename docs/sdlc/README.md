@@ -54,7 +54,7 @@ pcbkit may be agent-specific; pcbkit itself may not be.
 |---|---|---|
 | [M0](M0/) | shipped | Environment guard, CLI output contract |
 | [M1](M1/) | shipped | Circuit IR and capture DSL |
-| [M3](M3/spike.md) | spike done | `kicad-sch-api` writes KiCad 10 schematics |
+| [M3](M3/spike.md) | spike done | `kicad-sch-api` writes KiCad 10 schematics — its subject is **M5** under the revised plan |
 | [CR-001](CR-001-agent-neutral/) | accepted | No agent may be privileged |
 | [CR-002](CR-002-iterative-intent/) | accepted | Requirements are the entry point ([#1](https://github.com/BIOS9/agentic_pcb_toolkit/issues/1)) |
 | [CR-003](CR-003-open-source-only/) | accepted | Open-source toolchain only ([#2](https://github.com/BIOS9/agentic_pcb_toolkit/issues/2)) |
@@ -63,9 +63,17 @@ pcbkit may be agent-specific; pcbkit itself may not be.
 | [CR-006](CR-006-fab-capabilities-as-drc/) | accepted | Manufacturing capabilities are design constraints ([#5](https://github.com/BIOS9/agentic_pcb_toolkit/issues/5)) |
 | [CR-007](CR-007-jlcpcb-assembly-default/) | accepted | Assembled JLCPCB order is the default target ([#6](https://github.com/BIOS9/agentic_pcb_toolkit/issues/6)) |
 
-The approved implementation plan for M0-M7 lives outside the repo at
-`~/.claude/plans/i-want-to-build-zany-firefly.md`. CR-002, CR-004, and CR-005
-all change it; see their spec files for what they supersede.
+## The plan
+
+[`plan.md`](plan.md) is the current implementation plan, covering **M2-M10**. It
+supersedes the original M0-M7 plan, which was approved before any change request
+existed and which the CRs moved enough to invalidate from M2 onward. M0 and M1
+shipped under the original and are unchanged.
+
+Milestone numbers are not stable across the re-plan: the schematic emitter was
+M3 in the original and is M5 now, which is why `M3/spike.md` reads as being
+about a milestone that no longer holds that number. The spike's conclusion still
+stands.
 
 Several of these depend on each other. CR-005 relies on CR-004, because
 "regenerable, so do not commit it" is only a safe standard once regeneration is
