@@ -53,9 +53,13 @@ jobs:
           ASSOCIATION: ${{ github.event.comment.author_association }}
         run: |
           set -uo pipefail
+          # stderr is kept: this is the one step the spec says to smoke-test,
+          # and discarding the difference between "endpoint unreadable" and
+          # "not a collaborator at all" would discard the evidence that makes
+          # the test worth running.
           if permission=$(gh api \
               "repos/${{ github.repository }}/collaborators/$ACTOR/permission" \
-              --jq .permission 2>/dev/null); then
+              --jq .permission 2>err.log); then
             case "$permission" in
               admin|write|maintain)
                 echo "verdict accepted from $ACTOR ($permission)"
@@ -65,6 +69,9 @@ jobs:
                 exit 1 ;;
             esac
           fi
+
+          echo "::warning::could not read collaborator permission:"
+          sed 's/^/  /' err.log || true
 
           # The endpoint can be unavailable to GITHUB_TOKEN depending on how
           # the repository is configured. Failing closed here would deadlock
@@ -134,7 +141,12 @@ jobs:
           # line of the comment. An unanchored search lets a postscript after
           # the real verdict win -- "(earlier I wrote VERDICT: APPROVE)" would
           # flip a request for changes to success.
-          last=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | tail -1)
+          # Trailing whitespace is invisible in the editor that produced it,
+          # and this comparison is byte-exact. Without the trim, a stray space
+          # after a good verdict takes the error path -- and since the comment
+          # already named the head, that clears the author's own approval.
+          last=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | tail -1 \
+            | sed 's/[[:space:]]*$//')
           case "$last" in
             "VERDICT: APPROVE") state=success; desc="Agent review approved" ;;
             "VERDICT: APPROVE WITH COMMENTS") state=success; desc="Agent review approved with comments" ;;

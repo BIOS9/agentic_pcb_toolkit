@@ -9,6 +9,15 @@ on:
     # added after the first run would never be seen.
     types: [opened, synchronize, reopened, edited]
 
+# `gate` reads the pull request body as it was when the event fired, so two
+# edits in quick succession start two runs whose bodies differ and the one that
+# finishes last wins. Superseding the older run makes the newest body the one
+# that decides -- otherwise a deferral could be added, edited straight back out,
+# and the green from the first run survive.
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     runs-on: ubuntu-latest
@@ -47,19 +56,38 @@ jobs:
           fi
 
           verdict=$(printf '%s\n' "$BODY" | tr -d '\r' | awk -v want=checks '
-            # A declaration is prose at column 0, not an example. Fenced blocks
-            # and HTML comments both put text at column 0, and this syntax
-            # appears inside both in the documentation that teaches it -- so a
-            # pull request quoting its own README would otherwise defer its own
-            # checks, and one hiding the block in a comment would defer them
-            # with nothing visible on the page. Skipping these regions is the
-            # difference between a declaration and a mention.
-            /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+            # A declaration is prose at column 0, not an example. Fenced blocks and HTML
+            # comments both put text at column 0, and this syntax appears inside both in
+            # the documentation that teaches it -- so a pull request quoting its own
+            # README would otherwise defer its own checks, and one hiding the block in a
+            # comment would defer them with nothing visible on the page.
+            #
+            # The fence is matched by delimiter and run length, not toggled: quoting a
+            # document that itself contains a fence needs a longer outer fence, and a
+            # parity toggle would treat the inner one as a close and read the quoted
+            # example as a live declaration.
+            match($0, /^[[:space:]]*(```+|~~~+)/) {
+              run = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*/, "", run)
+              ch = substr(run, 1, 1)
+              if (!fence) { fence = 1; fence_ch = ch; fence_len = length(run) }
+              else if (ch == fence_ch && length(run) >= fence_len) { fence = 0 }
+              next
+            }
             fence { next }
             /<!--/ { comment = 1 }
             comment { if (/-->/) comment = 0; next }
 
+            function judge() {
+              if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) return "declared"
+              if (name == want) return "malformed"
+              return ""
+            }
+
+            # Evaluated when a block ends rather than on a fixed field order, so
+            # `resolves:` before `why:` is the same declaration, and a block immediately
+            # followed by another is not lost.
             /^deferred:/ {
+              if ((verdict = judge()) != "") exit
               sub(/^deferred:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, "")
               name = $0; why = ""; res = ""; next
             }
@@ -71,18 +99,7 @@ jobs:
               if (name != "") { sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0 }
               next
             }
-            # Evaluated once the block is complete rather than on a fixed field
-            # order, so `resolves:` before `why:` is the same declaration. An
-            # issue number must be a real one: `#0` names nothing, and a
-            # deferral that tracks nothing is not tracked debt.
-            name == want && why != "" && res ~ /^#?[1-9][0-9]*$/ { verdict = "declared"; exit }
-            END {
-              if (verdict == "") {
-                if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) verdict = "declared"
-                else if (name == want) verdict = "malformed"
-              }
-              if (verdict != "") print verdict
-            }
+            END { if (verdict == "") verdict = judge(); if (verdict != "") print verdict }
           ')
 
           case "$verdict" in
@@ -102,5 +119,6 @@ jobs:
               echo "::error::  why: <what is staged, and why this is not broken>"
               echo "::error::  resolves: #<issue that clears it>"
               echo "::error::at the start of a line, not inside a code fence or an HTML comment"
+              echo "::error::an unclosed fence or '<!--' earlier in the body hides everything after it"
               exit 1 ;;
           esac

@@ -218,6 +218,43 @@ def test_at_least_one_ci_step_can_fail_on_a_bad_board():
         assert "--strict" in step.command, f"{step.label}: gates without --strict"
 
 
+def test_the_gating_step_actually_fails_a_broken_project(tmp_path):
+    """Run it, rather than asserting the comment that says it gates.
+
+    The defect CR-008 was raised over was a CI step that could not fail, and
+    the way that survived was a check nobody executed. So this executes the
+    generated workflow's gating command against a project broken in a way the
+    build layer can see, and against the untouched scaffold.
+    """
+    import shlex
+    import subprocess
+    import sys
+
+    project = tmp_path / "demo"
+    new_project(project)
+    gating = [step for step in scaffold.CHECK_STEPS if step.gates]
+    argv = shlex.split(gating[0].command.format(design="src/demo.py"))
+
+    def run() -> int:
+        return subprocess.run(
+            [sys.executable, "-m", "pcbkit.cli", *argv[1:]],
+            cwd=project,
+            capture_output=True,
+            text=True,
+        ).returncode
+
+    assert run() == 0, "the scaffold as generated must pass its own gate"
+
+    design = project / "src" / "demo.py"
+    design.write_text(
+        design.read_text().replace(
+            "    rule.decouple(led, max_mm=5)",
+            "    orphan = R('10k', pkg='0603')   # connected to nothing",
+        )
+    )
+    assert run() == 1, "an unconnected part must fail the gate"
+
+
 def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
     """A workflow that runs `pcbkit doctor --strict` on a bare hosted runner
     fails on its first run: KiCad 10 and pcbnew are not installed there."""
@@ -230,17 +267,53 @@ def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
         assert step.command.format(design="src/demo.py") in workflow
 
 
-def test_generated_ci_pins_pcbkit_and_kicad(tmp_path):
-    """CR-004: an unpinned toolchain gives a board whose CI result can change
-    without the board changing."""
+def test_generated_ci_pins_kicad_to_the_confirmed_version(tmp_path):
+    """CR-004, and one version in one place. AGENTS.md rule 4 pins the file
+    formats against a specific KiCad; a container tag that drifted from it
+    would run the emitters against a KiCad those numbers were never confirmed
+    on."""
     new_project(tmp_path / "demo")
     workflow = (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
-    assert f"@v{__version__}" in workflow
     assert not scaffold.KICAD_IMAGE.endswith(("latest", "nightly"))
-    # One version, one place. AGENTS.md rule 4 pins the file formats against a
-    # specific KiCad; a container tag that drifts from it would run the
-    # emitters against a KiCad those numbers were never confirmed on.
     assert scaffold.KICAD_IMAGE.endswith(f":{kicad.CONFIRMED_KICAD_VERSION}")
+    assert f"container: {scaffold.KICAD_IMAGE}" in workflow
+
+
+def test_the_default_pcbkit_ref_is_one_that_resolves():
+    """A workflow whose first step cannot install pcbkit is a gate that can
+    never pass -- the same failure as naming a verb that does not exist.
+
+    pcbkit publishes no tags, so `v{__version__}` would be the pinned-and-
+    broken choice. This asserts the default is not a version tag; whether the
+    ref resolves is checked against the remote by hand, as the container tag
+    was, because a unit test must not need the network (CR-003).
+    """
+    assert not scaffold.DEFAULT_PCBKIT_REF.startswith("v")
+    assert scaffold.DEFAULT_PCBKIT_REF != __version__
+
+
+def test_pcbkit_ref_is_pinnable_and_reaches_the_workflow(tmp_path):
+    """The honest default runs; pinning is a flag away rather than a broken
+    file away."""
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    new_project(tmp_path / "demo", pcbkit_ref=sha)
+    project = tmp_path / "demo"
+    workflow = (project / ".github" / "workflows" / "checks.yml").read_text()
+    assert f"@{sha}" in workflow
+    assert f"@{scaffold.DEFAULT_PCBKIT_REF}" not in workflow
+    # And the README must name the ref the project actually got, or it teaches
+    # the reader to trust a pin that is not there.
+    assert sha in (project / "README.md").read_text()
+
+
+def test_readme_says_the_default_ref_is_not_pinned(tmp_path):
+    """CR-004 is not satisfied by the default, and saying so is the difference
+    between a documented limitation and a silent one."""
+    new_project(tmp_path / "demo")
+    readme = (tmp_path / "demo" / "README.md").read_text()
+    assert scaffold.DEFAULT_PCBKIT_REF in readme
+    assert "--pcbkit-ref" in readme
+    assert "can change without the project changing" in readme
 
 
 def test_generated_workflow_is_valid_yaml(tmp_path):
@@ -297,6 +370,31 @@ def test_the_gate_job_has_exactly_one_definition():
             "",
         ),
         ("<!-- deferred: checks -->\nwhy: x\nresolves: #1\n", ""),
+        # Nested fences. Quoting a document that itself contains a fence needs
+        # a longer outer fence -- which is exactly the case the exclusion
+        # exists for, "a pull request citing its own documentation". A parity
+        # toggle would read the inner fence as a close and take the quoted
+        # example as live.
+        (
+            "Quoting the README:\n\n`````markdown\n```\ndeferred: checks\n"
+            "why: schematic adds USB-C\nresolves: #42\n```\n`````\n",
+            "",
+        ),
+        # Mixed delimiters: a ~~~ line does not close a ``` fence.
+        (
+            "```\n~~~\ndeferred: checks\nwhy: quoted only\nresolves: #42\n~~~\n```\n",
+            "",
+        ),
+        ("~~~\n```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n~~~\n", ""),
+        # Two backticks is not a fence, so what surrounds it still declares.
+        ("``\ndeferred: checks\nwhy: staged\nresolves: #42\n``\n", "declared"),
+        # Adjacent blocks with no blank line between them: the first must not
+        # be lost, or blank-line placement becomes load-bearing.
+        (
+            "deferred: checks\nwhy: a\nresolves: #1\n"
+            "deferred: drc\nwhy: b\nresolves: #2\n",
+            "declared",
+        ),
         # A real declaration after a quoted one still counts.
         (
             "```\ndeferred: checks\nwhy: example\nresolves: #9\n```\n\n"

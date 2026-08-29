@@ -200,6 +200,17 @@ all, which is exactly the override taken quietly that `intent.md` rejects. The
 declaration has to be visible to the person reading the pull request, or it is
 not a record.
 
+The fence is matched by **delimiter and run length**, not by toggling a bit on
+every fence-looking line. Quoting a document that already contains a fence needs
+a longer outer fence, and a parity toggle would read the inner one as a close —
+so the quoted example would declare after all, one nesting level up. A `~~~`
+line likewise does not close a ``` fence.
+
+An unbalanced fence, or a literal `<!--` with no closing `-->`, hides everything
+after it. That fails closed — the declaration below is not seen and the gate
+blocks — and the gate's error message names the cause, because "no deferral
+declares it" is a confusing thing to read next to a deferral you can see.
+
 ### Why `gate` is the required context and `checks` is not
 
 A required status context in GitHub is all-or-nothing. Requiring `checks`
@@ -216,7 +227,10 @@ failure, which is what avoids mapping a `workflow_run` back to a pull request.
 `checks` still runs and is still visible; it simply is not the thing that
 blocks. The workflow triggers on `edited` as well as `synchronize`, so adding a
 declaration to the body re-evaluates the gate rather than requiring an empty
-commit.
+commit — and carries a `concurrency` group for the same reason `agent-review`
+does. Each run reads the body as it was when its event fired, so two quick
+edits race, and without superseding the older run a deferral could be added,
+edited straight back out, and the first run's green be the one that survives.
 
 Every deferral is a tracked debt: `pcbkit` gains no capability here, but the
 open declarations are visible in the PR list, and an unresolved one is a finding
@@ -244,8 +258,19 @@ in a user's repository.
 
 It runs inside the KiCad container: KiCad 10 and its `pcbnew` module are not on
 a hosted runner image, and a workflow whose first step cannot pass is not a
-gate. pcbkit itself is pinned at the version that generated the project, for the
-reason CR-004 gives.
+gate. The container tag derives from `CONFIRMED_KICAD_VERSION`, the single
+constant AGENTS.md rule 4's format numbers are pinned against, and was checked
+against the registry rather than assumed.
+
+**pcbkit's own ref is the one place this milestone does not achieve CR-004, and
+it says so.** Pinning to `v<version>` would be correct, but pcbkit publishes no
+tags, so that ref does not resolve and every generated project's first CI run
+would die before pcbkit was installed. A gate that cannot pass is the same
+failure as one that cannot fail. So the default is the default branch, which
+resolves; `pcbkit new --pcbkit-ref <tag-or-commit>` pins it; and the generated
+README states plainly that with the default, the project's CI result can change
+without the project changing. A documented limitation, not a silent one — and it
+closes the moment pcbkit tags a release.
 
 The `gate` job is shared verbatim between this repository's workflow and every
 generated one, pinned by a test. Two copies of a rule are two rules, and the one
@@ -293,6 +318,11 @@ rather than glossed over.
   context rather than an earlier success. A comment that merely mentions the
   syntax leaves the context untouched.
 - A review by an agent that did not author the change is recorded on the PR.
-- `pcbkit new` emits a checks workflow whose every command is a real CLI verb,
-  and a README naming the settings to enable and how to declare a deferral.
+- `pcbkit new` emits a checks workflow whose every command is a real CLI verb
+  and whose container and pcbkit refs both resolve, and a README naming the
+  settings to enable, how to declare a deferral, and which of its pins is not
+  one.
+- The generated workflow's gating step fails a project broken in a way the
+  build layer can see, and passes the scaffold as generated. Asserted by
+  running it, not by reading its comment.
 - This CR is itself merged through the flow it describes.
