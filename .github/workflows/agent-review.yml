@@ -1,0 +1,78 @@
+name: agent-review
+
+# CR-008 requires an independent agent review before merge. GitHub will not let
+# an account formally approve its own pull request, so the review lands as a
+# comment and this workflow converts it into a commit status that branch
+# protection can require.
+#
+# The status is attached to the PR's head SHA. That gives stale-approval
+# dismissal for free: push a new commit and it has no status, so the check is
+# missing again and the merge is blocked until the new code is reviewed.
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  statuses: write
+  pull-requests: read
+
+jobs:
+  record-verdict:
+    # Only PR comments that carry a verdict line. Everything else is ignored
+    # rather than failing, so ordinary discussion does not touch the status.
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, 'VERDICT:')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject verdicts from users without write access
+        # This repository is public, so without this check any passer-by could
+        # approve their own pull request by commenting on it.
+        env:
+          ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "verdict accepted from $ASSOCIATION" ;;
+            *)
+              echo "::error::verdict from '$ASSOCIATION' ignored; write access required"
+              exit 1 ;;
+          esac
+
+      - name: Resolve the head commit under review
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" --jq .head.sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "reviewing $sha"
+
+      - name: Parse the verdict
+        id: verdict
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          # Take the last verdict line, so an edited comment supersedes rather
+          # than accumulating.
+          line=$(printf '%s' "$BODY" | grep -oE 'VERDICT:[[:space:]]*(APPROVE WITH COMMENTS|APPROVE|REQUEST CHANGES)' | tail -1)
+          case "$line" in
+            *"REQUEST CHANGES"*) state=failure; desc="Agent review requested changes" ;;
+            *"APPROVE WITH COMMENTS"*) state=success; desc="Agent review approved with comments" ;;
+            *APPROVE*) state=success; desc="Agent review approved" ;;
+            *) echo "::error::no recognised verdict found"; exit 1 ;;
+          esac
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "desc=$desc" >> "$GITHUB_OUTPUT"
+
+      - name: Record the commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.sha }}" \
+            -f state='${{ steps.verdict.outputs.state }}' \
+            -f context='agent-review' \
+            -f description='${{ steps.verdict.outputs.desc }}' \
+            -f target_url='${{ github.event.comment.html_url }}'
