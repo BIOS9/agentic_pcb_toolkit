@@ -31,6 +31,10 @@ VENDOR = re.compile(
 ALLOWED_ENV_VARS = {
     "PCBKIT_PCBNEW_PYTHON",
     "LC_ALL",
+    # Standard interpreter variable, not agent-specific. Read only to prepend
+    # the pcbnew site-packages for that subprocess.
+    "PYTHONPATH",
+    toolchain.PCBNEW_PYTHONPATH_ENV,
     # M2 toolchain injection. All pcbkit-namespaced, none agent-specific.
     toolchain.TOOLCHAIN_ENV,
     *(t.env_var for t in toolchain.TOOLS),

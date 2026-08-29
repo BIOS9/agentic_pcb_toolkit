@@ -86,3 +86,36 @@ def test_kicad_module_delegates_rather_than_hardcoding():
 
     assert kicad.library_dir("symbols") == toolchain.resolve_library("symbols").path
     assert not hasattr(kicad, "DEFAULT_SYMBOL_DIR")
+
+
+def test_pcbnew_pythonpath_is_scoped_to_the_subprocess(monkeypatch):
+    """Nix ships pcbnew in kicad-base's site-packages, not on any interpreter's
+    default path. It must reach the pcbnew subprocess without leaking into our
+    own process, where it would shadow the uv venv."""
+    from pcbkit.core import kicad
+
+    monkeypatch.setenv(toolchain.PCBNEW_PYTHONPATH_ENV, "/store/kicad/site-packages")
+    assert toolchain.pcbnew_pythonpath() == "/store/kicad/site-packages"
+    assert kicad._pcbnew_env() == {"PYTHONPATH": "/store/kicad/site-packages"}
+
+    monkeypatch.setenv("PYTHONPATH", "/existing")
+    assert kicad._pcbnew_env()["PYTHONPATH"] == "/store/kicad/site-packages:/existing"
+
+
+def test_no_pcbnew_pythonpath_means_no_env_override(monkeypatch):
+    from pcbkit.core import kicad
+
+    monkeypatch.delenv(toolchain.PCBNEW_PYTHONPATH_ENV, raising=False)
+    assert kicad._pcbnew_env() == {}
+
+
+def test_run_accepts_extra_env_without_dropping_the_inherited_one():
+    from pcbkit.core import kicad
+
+    result = kicad.run(
+        ["sh", "-c", "echo $PCBKIT_TEST_MARKER $HOME"],
+        extra_env={"PCBKIT_TEST_MARKER": "set"},
+    )
+    assert result.ok
+    assert result.stdout.split()[0] == "set"
+    assert len(result.stdout.split()) == 2, "inherited environment was discarded"

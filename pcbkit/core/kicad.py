@@ -62,7 +62,13 @@ class Completed:
         return self.returncode == 0
 
 
-def run(argv: list[str], *, timeout: int = 300, check: bool = False) -> Completed:
+def run(
+    argv: list[str],
+    *,
+    timeout: int = 300,
+    check: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> Completed:
     """Run a subprocess, capturing output.
 
     `check=True` raises KicadError on a nonzero exit. Never infer failure from
@@ -75,7 +81,7 @@ def run(argv: list[str], *, timeout: int = 300, check: bool = False) -> Complete
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "LC_ALL": "C"},
+            env={**os.environ, "LC_ALL": "C", **(extra_env or {})},
         )
     except FileNotFoundError as exc:
         raise KicadError(f"executable not found: {argv[0]}") from exc
@@ -150,12 +156,23 @@ def _interpreter_candidates() -> list[str]:
     return ordered
 
 
+def _pcbnew_env() -> dict[str, str]:
+    """PYTHONPATH for the pcbnew subprocess only, never for our own process."""
+    path = toolchain.pcbnew_pythonpath()
+    if not path:
+        return {}
+    existing = os.environ.get("PYTHONPATH")
+    return {"PYTHONPATH": f"{path}:{existing}" if existing else path}
+
+
 def _probe_pcbnew(interpreter: str) -> str | None:
     """Return the pcbnew build version this interpreter reports, or None."""
     if not Path(interpreter).exists():
         return None
     try:
-        result = run([interpreter, "-c", _PCBNEW_PROBE], timeout=60)
+        result = run(
+            [interpreter, "-c", _PCBNEW_PROBE], timeout=60, extra_env=_pcbnew_env()
+        )
     except KicadError:
         return None
     if not result.ok:
@@ -194,7 +211,7 @@ def run_pcbnew(script: str, *, timeout: int = 300) -> Completed:
             "no Python interpreter with the pcbnew module was found; "
             f"set {PCBNEW_PYTHON_ENV} to point at one"
         )
-    return run([interpreter, "-c", script], timeout=timeout)
+    return run([interpreter, "-c", script], timeout=timeout, extra_env=_pcbnew_env())
 
 
 def pcbnew_version() -> str | None:

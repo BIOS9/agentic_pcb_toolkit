@@ -85,3 +85,17 @@ def test_require_pinned_gates_separately_from_health(capsys, monkeypatch):
     monkeypatch.setattr(env.toolchain, "is_pinned", lambda: True)
     assert main(["doctor", "--require-pinned"]) == 0
     capsys.readouterr()
+
+
+def test_require_pinned_and_strict_gate_different_things(capsys, monkeypatch, broken_env):
+    """A pinned toolchain can still be broken.
+
+    Found for real: inside the flake every tool resolved from the store, but
+    pcbnew could not be imported, and `--require-pinned` alone exited 0. CI
+    would have gone green on a dead toolchain, so the flake uses both.
+    """
+    monkeypatch.setattr(env.toolchain, "is_pinned", lambda: True)
+    assert main(["doctor", "--require-pinned"]) == 0   # provenance is fine
+    capsys.readouterr()
+    assert main(["doctor", "--strict"]) == 1           # health is not
+    capsys.readouterr()

@@ -30,12 +30,14 @@
         nixpkgs.lib.concatStringsSep "\n"
           (nixpkgs.lib.mapAttrsToList (k: v: ''export ${k}="${v}"'') (envFor pkgs));
 
-      # pcbnew is a system C++ extension, not a pip package, so the venv cannot
-      # import it. Point pcbkit at the interpreter that ships with KiCad.
+      # pcbnew is a C++ extension, not a pip package, so no venv can import it.
+      # Nix puts it in kicad-base's site-packages rather than on any
+      # interpreter's default path, so name both explicitly: guessing a
+      # `kicad-python3` wrapper silently fell back to a python without the
+      # bindings, and doctor reported the environment broken.
       pcbnewExport = pkgs: ''
-        export PCBKIT_PCBNEW_PYTHON="${pkgs.kicad}/bin/kicad-python3"
-        [ -x "$PCBKIT_PCBNEW_PYTHON" ] || PCBKIT_PCBNEW_PYTHON="$(command -v python3)"
-        export PCBKIT_PCBNEW_PYTHON
+        export PCBKIT_PCBNEW_PYTHON="${pkgs.python314}/bin/python3"
+        export PCBKIT_PCBNEW_PYTHONPATH="${pkgs.kicad.base}/${pkgs.python314.sitePackages}"
       '';
     in
     {
@@ -66,7 +68,10 @@
           checks = app "pcbkit-checks" ''
             uv sync --frozen
             uv run pytest -q
-            uv run pcbkit doctor --require-pinned --text
+            # Both gates: --strict is health, --require-pinned is provenance.
+            # --require-pinned alone passed on an environment whose pcbnew was
+            # broken, which would have let CI go green on a dead toolchain.
+            uv run pcbkit doctor --strict --require-pinned --text
           '';
           licences = app "pcbkit-licences" ''
             uv sync --frozen

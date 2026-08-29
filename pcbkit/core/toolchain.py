@@ -87,6 +87,16 @@ LIBRARY_DIRS = (
 # reason the library fallbacks do.
 PCBNEW_PYTHON_FALLBACKS = ("/usr/bin/python3", "/usr/local/bin/python3")
 
+# Nix ships the bindings in kicad-base's site-packages rather than on any
+# interpreter's default path, so the flake names the directory here and
+# `kicad.run_pcbnew` puts it on PYTHONPATH for that subprocess only. Setting it
+# globally would leak into the uv venv.
+PCBNEW_PYTHONPATH_ENV = "PCBKIT_PCBNEW_PYTHONPATH"
+
+
+def pcbnew_pythonpath() -> str | None:
+    return os.environ.get(PCBNEW_PYTHONPATH_ENV) or None
+
 _TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 _DIRS_BY_NAME = {d.name: d for d in LIBRARY_DIRS}
 
