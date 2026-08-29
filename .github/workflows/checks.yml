@@ -1,0 +1,20 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+
+      # CR-004: CI runs exactly what a developer runs. Anything expressed here
+      # in YAML instead of the flake is a second source of truth and will drift.
+      - run: nix run .#checks
+      - run: nix run .#licences

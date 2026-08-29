@@ -15,6 +15,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from pcbkit.core import toolchain
+
 # File format versions emitted by KiCad 10.0.5, confirmed empirically on the
 # target machine (see docs/sdlc/M0/spec.md). Emitters target these exactly; the
 # doctor check warns when the installed KiCad drifts away from them.
@@ -34,10 +36,10 @@ MIN_KICAD_VERSION = (10, 0, 0)
 F_CU = 0
 B_CU = 2
 
-DEFAULT_SYMBOL_DIR = Path("/usr/share/kicad/symbols")
-DEFAULT_FOOTPRINT_DIR = Path("/usr/share/kicad/footprints")
-DEFAULT_3DMODEL_DIR = Path("/usr/share/kicad/3dmodels")
-DEFAULT_TEMPLATE_DIR = Path("/usr/share/kicad/template")
+def library_dir(name: str) -> Path | None:
+    """A KiCad data directory, or None. Resolution and provenance live in
+    `toolchain`; nothing here may assume a system path."""
+    return toolchain.resolve_library(name).path
 
 
 class _Unset:
@@ -89,7 +91,13 @@ def run(argv: list[str], *, timeout: int = 300, check: bool = False) -> Complete
 
 
 def which(name: str) -> str | None:
-    return shutil.which(name)
+    """Locate a pcbkit-managed tool. Goes through `toolchain` so the answer
+    carries provenance; `shutil.which` directly would lose that."""
+    try:
+        resolved = toolchain.resolve_tool(name)
+    except KeyError:
+        return shutil.which(name)
+    return str(resolved.path) if resolved.path else None
 
 
 def parse_version(text: str) -> tuple[int, ...] | None:
@@ -129,7 +137,7 @@ def _interpreter_candidates() -> list[str]:
     override = os.environ.get(PCBNEW_PYTHON_ENV)
     if override:
         return [override]
-    candidates = [sys.executable, "/usr/bin/python3", "/usr/local/bin/python3"]
+    candidates = [sys.executable, *toolchain.PCBNEW_PYTHON_FALLBACKS]
     found = which("python3")
     if found:
         candidates.append(found)

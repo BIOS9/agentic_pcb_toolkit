@@ -129,6 +129,18 @@ caught while iterating digitally costs seconds; caught at order time it costs a
 respin; caught by the fab's own optimiser it may never be reported at all.
 See [CR-006](docs/sdlc/CR-006-fab-capabilities-as-drc/).
 
+### 11. Never hardcode a system path or call `shutil.which` directly
+
+Every external tool and library directory resolves through
+`pcbkit/core/toolchain.py`, which records *where* the answer came from so
+`doctor` can report whether the environment is pinned. A bare
+`shutil.which("ngspice")` or a literal `/usr/share/kicad/...` silently
+reintroduces the machine dependence CR-004 removed, and
+`tests/test_toolchain.py` fails on the literal.
+
+Adding a tool means adding a `Tool` entry, not a lookup at the call site.
+See [CR-004](docs/sdlc/CR-004-reproducible-builds/) and [M2](docs/sdlc/M2/).
+
 ## Layout
 
 - `pcbkit/core/` — pure functions. No argv, no stdout, no `sys.exit`.

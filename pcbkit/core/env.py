@@ -15,7 +15,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from pcbkit.core import kicad
+from pcbkit.core import kicad, toolchain
 from pcbkit.core.result import Envelope, Finding, Severity
 
 CACHE_DIR = Path.home() / ".cache" / "pcbkit"
@@ -56,9 +56,14 @@ def check_python() -> Check:
 
 
 def check_kicad_cli() -> Check:
-    exe = kicad.which("kicad-cli")
+    resolved = toolchain.resolve_tool("kicad-cli")
+    exe = str(resolved.path) if resolved.path else None
     if exe is None:
-        return _fail("kicad-cli", "not found on PATH", "install KiCad 10 or later")
+        return _fail(
+            "kicad-cli",
+            "not found",
+            "install KiCad 10 or later, or enter the flake shell (`nix develop`)",
+        )
     version = kicad.kicad_cli_version()
     if version is None:
         return _fail("kicad-cli", f"{exe}: could not parse version", "check the install")
@@ -66,7 +71,7 @@ def check_kicad_cli() -> Check:
     if version < kicad.MIN_KICAD_VERSION:
         want = ".".join(str(p) for p in kicad.MIN_KICAD_VERSION)
         return _fail("kicad-cli", f"{text} at {exe}", f"pcbkit needs >= {want}")
-    return _ok("kicad-cli", f"{text} at {exe}")
+    return _ok("kicad-cli", f"{text} at {resolved.describe()}")
 
 
 def check_pcbnew() -> Check:
@@ -84,18 +89,25 @@ def check_pcbnew() -> Check:
 
 def check_libraries() -> list[Check]:
     checks: list[Check] = []
-    for id_, path, pattern, minimum in (
-        ("symbols", kicad.DEFAULT_SYMBOL_DIR, "*.kicad_sym", 50),
-        ("footprints", kicad.DEFAULT_FOOTPRINT_DIR, "*.pretty", 50),
-        ("3dmodels", kicad.DEFAULT_3DMODEL_DIR, "*", 10),
+    for id_, pattern, minimum in (
+        ("symbols", "*.kicad_sym", 50),
+        ("footprints", "*.pretty", 50),
+        ("3dmodels", "*", 10),
     ):
-        if not path.is_dir():
+        resolved = toolchain.resolve_library(id_)
+        path = resolved.path
+        if path is None:
             checks.append(
-                _fail(id_, f"{path} missing", f"install the KiCad {id_} library package")
+                _fail(
+                    id_,
+                    "not found",
+                    f"install the KiCad {id_} library package, or set "
+                    f"{toolchain._DIRS_BY_NAME[id_].env_var}",
+                )
             )
             continue
         count = len(list(path.glob(pattern)))
-        detail = f"{count} in {path}"
+        detail = f"{count} in {resolved.describe()}"
         if count < minimum:
             checks.append(
                 _warn(id_, detail, f"expected at least {minimum}; library may be partial")
@@ -145,40 +157,66 @@ def check_pcb_format() -> Check:
 
 
 def check_ngspice() -> Check:
-    exe = kicad.which("ngspice")
-    if exe is None:
+    resolved = toolchain.resolve_tool("ngspice")
+    if not resolved.found:
         return _warn(
-            "ngspice", "not found", "optional; needed for `pcbkit check --sim` (M5)"
+            "ngspice", "not found", "optional; needed for `pcbkit check --sim` (M7)"
         )
-    return _ok("ngspice", exe)
+    return _ok("ngspice", resolved.describe())
 
 
 def check_java() -> Check:
-    exe = kicad.which("java")
-    if exe is None:
+    resolved = toolchain.resolve_tool("java")
+    if not resolved.found:
         return _warn(
-            "java", "not found", "optional; needed by the freerouting autorouter (M6)"
+            "java", "not found", "optional; needed by the freerouting autorouter (M9)"
         )
-    return _ok("java", exe)
+    return _ok("java", resolved.describe())
+
+
+def check_pinned() -> Check:
+    """Provenance, not availability.
+
+    An unpinned environment works; it just cannot promise the same output on
+    another machine. Reporting that plainly is the point of CR-004 -- the old
+    format-drift warning was a symptom of not knowing.
+    """
+    if toolchain.is_pinned():
+        return _ok("toolchain", "pinned (nix)")
+    return _warn(
+        "toolchain",
+        "unpinned (system tools)",
+        "run `nix develop` for a reproducible toolchain; builds still work "
+        "without it, but are not guaranteed to match another machine",
+    )
 
 
 def check_freerouting() -> Check:
-    if not FREEROUTING_JAR.exists():
-        return _warn(
-            "freerouting",
-            f"{FREEROUTING_JAR.name} not cached",
-            "optional until M6; `pcbkit route` downloads it on first use",
-        )
-    size_mb = FREEROUTING_JAR.stat().st_size // (1024 * 1024)
-    return _ok("freerouting", f"{FREEROUTING_JAR} ({size_mb} MB)")
+    """Since M2 this comes from the flake rather than a downloaded jar.
+
+    The cached-jar path stays as a fallback for unpinned users, but a pinned
+    environment should never reach it -- downloading a router at first use is
+    exactly the non-reproducibility CR-004 removes.
+    """
+    resolved = toolchain.resolve_tool("freerouting")
+    if resolved.found:
+        return _ok("freerouting", resolved.describe())
+    if FREEROUTING_JAR.exists():
+        size_mb = FREEROUTING_JAR.stat().st_size // (1024 * 1024)
+        return _ok("freerouting", f"{FREEROUTING_JAR} ({size_mb} MB, unpinned cache)")
+    return _warn(
+        "freerouting",
+        "not found",
+        "optional until M9; provided by `nix develop`, or cached on first use",
+    )
 
 
 def all_checks() -> list[Check]:
-    checks = [check_python(), check_kicad_cli(), check_pcbnew()]
+    checks = [check_pinned(), check_python(), check_kicad_cli(), check_pcbnew()]
     checks.extend(check_libraries())
     # Only meaningful once pcbnew imports; skip rather than report a confusing
     # second failure for the same root cause.
-    if checks[2].status is Status.OK:
+    if checks[3].status is Status.OK:
         checks.append(check_pcb_format())
     checks.extend([check_ngspice(), check_java(), check_freerouting()])
     return checks
@@ -205,6 +243,8 @@ def doctor() -> Envelope:
         data={
             "checks": [c.model_dump(mode="json") for c in checks],
             "healthy": not any(c.status is Status.FAIL for c in checks),
+            "pinned": toolchain.is_pinned(),
+            "toolchain": toolchain.summary(),
             "format_versions": kicad.FORMAT_VERSIONS,
         },
         findings=findings,

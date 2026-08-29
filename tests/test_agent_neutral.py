@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from pcbkit.cli import build_parser
+from pcbkit.core import toolchain
 
 REPO = Path(__file__).resolve().parent.parent
 PACKAGE = REPO / "pcbkit"
@@ -27,12 +28,19 @@ VENDOR = re.compile(
 
 # The only environment variable pcbkit reads. Anything else risks coupling the
 # toolkit to one harness's ambient state.
-ALLOWED_ENV_VARS = {"PCBKIT_PCBNEW_PYTHON", "LC_ALL"}
+ALLOWED_ENV_VARS = {
+    "PCBKIT_PCBNEW_PYTHON",
+    "LC_ALL",
+    # M2 toolchain injection. All pcbkit-namespaced, none agent-specific.
+    toolchain.TOOLCHAIN_ENV,
+    *(t.env_var for t in toolchain.TOOLS),
+    *(d.env_var for d in toolchain.LIBRARY_DIRS),
+}
 
 # Capabilities that ship today. Each must be reachable from the CLI alone: a
 # feature living only behind a hook or skill does not exist for other agents.
 # Add to this as milestones land -- that is the point of the list.
-SHIPPED_VERBS = {"doctor", "build"}
+SHIPPED_VERBS = {"doctor", "build", "licences"}
 
 
 def python_sources() -> list[Path]:
