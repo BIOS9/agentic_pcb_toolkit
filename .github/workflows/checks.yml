@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `edited` matters: a deferral is declared in the pull request body, so
+    # editing the body must re-evaluate the gate. Without it a declaration
+    # added after the first run would never be seen.
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
   checks:
@@ -18,3 +22,70 @@ jobs:
       # in YAML instead of the flake is a second source of truth and will drift.
       - run: nix run .#checks
       - run: nix run .#licences
+
+  # `checks` is deliberately *not* the required status context: a required
+  # context in GitHub is all-or-nothing, so a knowingly-red check could only be
+  # got past by an admin bypass -- the quiet override CR-008 rejects. `gate` is
+  # required instead, and it passes either because `checks` is green or because
+  # the pull request body declares the failure, says why, and names what
+  # resolves it.
+  gate:
+    needs: [checks]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a green check, or a declared deferral
+        env:
+          RESULT: ${{ needs.checks.result }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -uo pipefail
+
+          if [ "$RESULT" = "success" ]; then
+            echo "checks passed"
+            exit 0
+          fi
+
+          verdict=$(printf '%s\n' "$BODY" | tr -d '\r' | awk -v want=checks '
+            /^deferred:/ {
+              sub(/^deferred:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, "")
+              name = $0; why = ""; res = ""; next
+            }
+            /^why:/ {
+              if (name != "") { sub(/^why:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); why = $0 }
+              next
+            }
+            /^resolves:/ {
+              if (name == want) {
+                sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0
+                verdict = (why != "" && res ~ /^#?[0-9]+$/) ? "declared" : "malformed"
+                name = ""; exit
+              }
+              name = ""; next
+            }
+            # awk runs END even on exit, so the verdict is set once and printed
+            # once here. A block that names the check but stops short of
+            # resolves is malformed, not absent.
+            END {
+              if (verdict == "" && name == want) verdict = "malformed"
+              if (verdict != "") print verdict
+            }
+          ')
+
+          case "$verdict" in
+            declared)
+              echo "::warning::checks is '$RESULT' and deferred by declaration in the pull request body"
+              echo "Tracked debt, not a pass. An unresolved deferral is a finding at the fab gate."
+              exit 0 ;;
+            malformed)
+              echo "::error::the deferral for 'checks' is incomplete"
+              echo "::error::it needs all three lines: 'deferred: checks', a non-empty 'why:', and 'resolves: #<issue>'"
+              exit 1 ;;
+            *)
+              echo "::error::checks is '$RESULT' and no deferral declares it"
+              echo "::error::fix the check, or declare the deferral in the pull request body:"
+              echo "::error::  deferred: checks"
+              echo "::error::  why: <what is staged, and why this is not broken>"
+              echo "::error::  resolves: #<issue that clears it>"
+              exit 1 ;;
+          esac

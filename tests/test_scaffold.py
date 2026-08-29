@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 
 import pytest
 
+from pcbkit import __version__
 from pcbkit.cli import main
-from pcbkit.core import kicad
+from pcbkit.core import kicad, scaffold
 from pcbkit.core.scaffold import (
     check_design_rules,
     new_project,
@@ -24,7 +26,9 @@ def test_new_project_layout(tmp_path):
     assert envelope.ok
     created = set(envelope.data["created"])
     assert created == {
+        ".github/workflows/checks.yml",
         ".gitignore",
+        "README.md",
         "demo.kicad_dru",
         "pcbkit.toml",
         "profiles/jlcpcb.yaml",
@@ -179,3 +183,165 @@ pcbnew.SaveBoard({str(board)!r}, b)
     # KiCad names our rule, which proves the rules file is the source.
     assert "Track width, outer layer" in widths[0]["description"]
     assert f"{limit:.4f}" in widths[0]["description"]
+
+
+# CR-008: a board change reaches main only through a reviewed pull request whose
+# checks passed. pcbkit cannot enable branch protection on someone else's
+# account, so it emits the workflow and documents the settings.
+
+
+def test_generated_ci_runs_only_verbs_the_cli_actually_has():
+    """The defect CR-008 was raised over was a CI step that could not fail. A
+    step naming a verb that does not exist is the same failure one stage
+    earlier, and it would be discovered by a user, in their CI, not here."""
+    import shlex
+
+    from pcbkit.cli import build_parser
+
+    parser = build_parser()
+    for label, command in scaffold.CHECK_STEPS:
+        argv = shlex.split(command.format(design="src/demo.py"))
+        assert argv[0] == "pcbkit", f"{label}: not a pcbkit invocation"
+        try:
+            parser.parse_args(argv[1:])
+        except SystemExit as exc:  # argparse exits rather than raising
+            pytest.fail(f"{label}: `{command}` is not a valid pcbkit invocation ({exc})")
+
+
+def test_generated_ci_gates_rather_than_reports(tmp_path):
+    """Every step must be able to fail. `--strict` is what turns pcbkit's
+    findings-are-data contract into a gate (AGENTS.md rule 3); a step without it
+    has to be one whose nonzero exit means a tool failed."""
+    gating = {"--strict", "regenerate"}
+    for label, command in scaffold.CHECK_STEPS:
+        assert gating & set(command.split()), f"{label}: `{command}` cannot fail"
+
+
+def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
+    """A workflow that runs `pcbkit doctor --strict` on a bare hosted runner
+    fails on its first run: KiCad 10 and pcbnew are not installed there."""
+    new_project(tmp_path / "demo")
+    workflow = (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
+
+    assert f"container: {scaffold.KICAD_IMAGE}" in workflow
+    assert "pull_request:" in workflow
+    for _, command in scaffold.CHECK_STEPS:
+        assert command.format(design="src/demo.py") in workflow
+
+
+def test_generated_ci_pins_pcbkit(tmp_path):
+    """CR-004: an unpinned toolchain gives a board whose CI result can change
+    without the board changing."""
+    new_project(tmp_path / "demo")
+    workflow = (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
+    assert f"@v{__version__}" in workflow
+    assert scaffold.KICAD_IMAGE.count(":") == 1, "image tag must be pinned, not latest"
+    assert not scaffold.KICAD_IMAGE.endswith(("latest", "nightly"))
+
+
+def test_generated_workflow_is_valid_yaml(tmp_path):
+    """It is a Python f-string producing YAML, which is a shape that breaks
+    silently: the file only fails when a user pushes it."""
+    import yaml
+
+    new_project(tmp_path / "demo")
+    parsed = yaml.safe_load(
+        (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
+    )
+    assert set(parsed["jobs"]) == {"checks", "gate"}
+    assert parsed["jobs"]["gate"]["needs"] == ["checks"]
+    # `edited` is what makes a deferral added to the body take effect.
+    # YAML 1.1 reads a bare `on:` key as the boolean true, hence the subscript.
+    assert "edited" in parsed[True]["pull_request"]["types"]
+
+
+def test_the_gate_job_has_exactly_one_definition():
+    """This repository's own workflow and every generated one must run the same
+    deferral gate. Two copies of a rule are two rules, and the one nobody looks
+    at is the one that rots."""
+    ours = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "checks.yml").read_text()
+    assert scaffold.GATE_JOB in ours, (
+        "the gate job in .github/workflows/checks.yml has drifted from "
+        "pcbkit.core.scaffold.GATE_JOB"
+    )
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("deferred: checks\nwhy: layout lands later\nresolves: #42\n", "declared"),
+        # CRLF: GitHub delivers pull request bodies with Windows line endings.
+        ("prose\r\n\r\ndeferred: checks\r\nwhy: staged\r\nresolves: #42\r\n", "declared"),
+        ("deferred: checks\nwhy: staged\nresolves: 42\n", "declared"),
+        # Each missing field is a malformed declaration, not an absent one:
+        # someone tried to defer and the gate must say why it did not take.
+        ("deferred: checks\nresolves: #42\n", "malformed"),
+        ("deferred: checks\nwhy:\nresolves: #42\n", "malformed"),
+        ("deferred: checks\nwhy: staged\nresolves: later\n", "malformed"),
+        ("deferred: checks\nwhy: staged\n", "malformed"),
+        # A deferral of some other check does not excuse this one.
+        ("deferred: drc\nwhy: staged\nresolves: #42\n", ""),
+        ("an ordinary pull request body\n", ""),
+        # Indented, so it is prose or a quoted example rather than a declaration.
+        ("  deferred: checks\n  why: x\n  resolves: #42\n", ""),
+        (
+            "deferred: drc\nwhy: a\nresolves: #1\ndeferred: checks\nwhy: b\nresolves: #2\n",
+            "declared",
+        ),
+    ],
+)
+def test_deferral_parser(body, expected, tmp_path):
+    """The gate is a shell script in YAML, which nothing else here can test.
+    Extracting its awk program and running it is the only way to know it works
+    before it decides whether a real change may merge."""
+    import re
+    import subprocess
+
+    match = re.search(r"awk -v want=checks '\n(.*?)\n\s*'\)", scaffold.GATE_JOB, re.S)
+    assert match, "could not extract the awk program from GATE_JOB"
+    program = textwrap.dedent(match.group(1))
+
+    script = tmp_path / "gate.awk"
+    script.write_text(program)
+    result = subprocess.run(
+        ["awk", "-v", "want=checks", "-f", str(script)],
+        input=body.replace("\r", ""),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == expected
+
+
+def test_readme_names_the_settings_pcbkit_cannot_enable(tmp_path):
+    """pcbkit produces the workflow and documents the rest rather than
+    pretending it configured the repository."""
+    new_project(tmp_path / "demo")
+    readme = (tmp_path / "demo" / "README.md").read_text()
+
+    for context in scaffold.REQUIRED_CONTEXTS:
+        assert f"`{context}`" in readme
+    assert "Require a pull request before merging" in readme
+    # The reader must be told the workflow alone blocks nothing.
+    assert "does not block" in readme
+    # And which of the two contexts nothing in the project produces.
+    assert "agent-review` is produced only" in readme
+    # The escape hatch has to be documented where someone hitting a red check
+    # will look, or they will reach for an admin bypass instead.
+    assert "deferred: checks" in readme
+    assert "resolves: #42" in readme
+
+
+def test_generated_project_documents_what_is_not_committed(tmp_path):
+    """CR-005. The README and the .gitignore must agree, or one of them is
+    teaching the wrong habit."""
+    new_project(tmp_path / "demo")
+    project = tmp_path / "demo"
+    readme = (project / "README.md").read_text()
+    ignored = (project / ".gitignore").read_text()
+
+    assert "demo.kicad_dru" in readme
+    assert "*.kicad_dru" in ignored
+    # The workflow and README are project source, so they must not be ignored.
+    assert "README" not in ignored
+    assert ".github" not in ignored

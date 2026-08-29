@@ -5,9 +5,10 @@ name: agent-review
 # comment and this workflow converts it into a commit status that branch
 # protection can require.
 #
-# The status is attached to the PR's head SHA. That gives stale-approval
-# dismissal for free: push a new commit and it has no status, so the check is
-# missing again and the merge is blocked until the new code is reviewed.
+# The verdict names the commit it reviewed and this workflow refuses to record
+# it anywhere else. Resolving the head SHA at run time is not enough: a fork PR
+# can be force-pushed between the reviewer reading the diff and the comment
+# landing, which would stamp a verdict onto code nobody read.
 
 on:
   issue_comment:
@@ -17,52 +18,100 @@ permissions:
   statuses: write
   pull-requests: read
 
+# Two verdicts posted seconds apart must not race: a commit status is
+# last-write-wins per context, so out-of-order delivery decides the outcome.
+concurrency:
+  group: agent-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   record-verdict:
     # Only PR comments that carry a verdict line. Everything else is ignored
     # rather than failing, so ordinary discussion does not touch the status.
+    #
+    # The association test is here rather than in a step so a passer-by on this
+    # public repository cannot start a runner by commenting the trigger string.
+    # It is a cheap filter, not the authorisation check -- author_association
+    # says nothing about repository permission, so the real check runs below.
     if: >-
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, 'VERDICT:')
+      contains(github.event.comment.body, 'VERDICT:') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     steps:
-      - name: Reject verdicts from users without write access
-        # This repository is public, so without this check any passer-by could
-        # approve their own pull request by commenting on it.
+      - name: Require write access to this repository
+        id: guard
+        # COLLABORATOR covers read-only and triage invitations, and MEMBER is
+        # org membership; neither implies the ability to push. This repository
+        # is public, so the difference is the whole control: without it an
+        # account trusted only to read could turn its own pull request green.
         env:
-          ASSOCIATION: ${{ github.event.comment.author_association }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.event.comment.user.login }}
         run: |
-          case "$ASSOCIATION" in
-            OWNER|MEMBER|COLLABORATOR)
-              echo "verdict accepted from $ASSOCIATION" ;;
+          set -euo pipefail
+          permission=$(gh api \
+            "repos/${{ github.repository }}/collaborators/$ACTOR/permission" \
+            --jq .permission)
+          case "$permission" in
+            admin|write|maintain)
+              echo "verdict accepted from $ACTOR ($permission)" ;;
             *)
-              echo "::error::verdict from '$ASSOCIATION' ignored; write access required"
+              echo "::error::verdict from '$ACTOR' ignored; has '$permission', needs write"
               exit 1 ;;
           esac
 
-      - name: Resolve the head commit under review
+      - name: Resolve the head commit
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           sha=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" --jq .head.sha)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "reviewing $sha"
+          echo "head is $sha"
 
       - name: Parse the verdict
         id: verdict
         env:
           BODY: ${{ github.event.comment.body }}
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
         run: |
-          # Take the last verdict line, so an edited comment supersedes rather
-          # than accumulating.
-          line=$(printf '%s' "$BODY" | grep -oE 'VERDICT:[[:space:]]*(APPROVE WITH COMMENTS|APPROVE|REQUEST CHANGES)' | tail -1)
-          case "$line" in
-            *"REQUEST CHANGES"*) state=failure; desc="Agent review requested changes" ;;
-            *"APPROVE WITH COMMENTS"*) state=success; desc="Agent review approved with comments" ;;
-            *APPROVE*) state=success; desc="Agent review approved" ;;
-            *) echo "::error::no recognised verdict found"; exit 1 ;;
+          set -euo pipefail
+          # GitHub delivers comment bodies with CRLF line endings.
+          body=$(printf '%s' "$BODY" | tr -d '\r')
+
+          # Anchored to the start of a line, and it must be the last non-empty
+          # line of the comment. An unanchored search lets a postscript after
+          # the real verdict win -- "(earlier I wrote VERDICT: APPROVE)" would
+          # flip a request for changes to success.
+          last=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | tail -1)
+          case "$last" in
+            "VERDICT: APPROVE") state=success; desc="Agent review approved" ;;
+            "VERDICT: APPROVE WITH COMMENTS") state=success; desc="Agent review approved with comments" ;;
+            "VERDICT: REQUEST CHANGES") state=failure; desc="Agent review requested changes" ;;
+            *)
+              echo "::error::the last line of the comment must be exactly one of:"
+              echo "::error::  VERDICT: APPROVE / VERDICT: APPROVE WITH COMMENTS / VERDICT: REQUEST CHANGES"
+              echo "::error::got: $last"
+              exit 1 ;;
           esac
+
+          # The verdict must name the commit it reviewed. This is what makes a
+          # verdict unreplayable: editing an old approving comment re-runs this
+          # workflow, and without the binding it would re-stamp whatever head
+          # happens to be current -- silently un-dismissing a stale approval.
+          reviewed=$(printf '%s\n' "$body" | grep -oiE '^reviewed:[[:space:]]*[0-9a-f]{7,40}' | tail -1 | grep -oE '[0-9a-f]{7,40}' || true)
+          if [ -z "$reviewed" ]; then
+            echo "::error::verdict has no 'reviewed: <sha>' line naming the commit it reviewed"
+            exit 1
+          fi
+          if [ "${HEAD_SHA#"$reviewed"}" = "$HEAD_SHA" ]; then
+            echo "::error::verdict reviewed $reviewed, but head is $HEAD_SHA"
+            echo "::error::the branch moved; review the new commit"
+            exit 1
+          fi
+
           echo "state=$state" >> "$GITHUB_OUTPUT"
           echo "desc=$desc" >> "$GITHUB_OUTPUT"
 
@@ -70,9 +119,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           gh api --method POST \
             "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.sha }}" \
             -f state='${{ steps.verdict.outputs.state }}' \
             -f context='agent-review' \
             -f description='${{ steps.verdict.outputs.desc }}' \
             -f target_url='${{ github.event.comment.html_url }}'
+
+      - name: Report a failure that would otherwise be invisible
+        # An issue_comment run does not appear in the pull request's checks
+        # list, so without this a malformed or stale verdict fails silently and
+        # an earlier success keeps standing. Only reached once the permission
+        # guard has passed, so an untrusted comment cannot clear a status.
+        if: failure() && steps.guard.outcome == 'success' && steps.pr.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.sha }}" \
+            -f state='error' \
+            -f context='agent-review' \
+            -f description='Verdict could not be recorded; see the run log' \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -35,6 +35,266 @@ build/
 fp-info-cache
 """
 
+# CR-008: a board change reaches the default branch only through a reviewed
+# pull request whose checks passed. The two required status contexts.
+REQUIRED_CONTEXTS = ("gate", "agent-review")
+
+# The generated workflow needs KiCad 10 and the pcbnew module, neither of which
+# is on a hosted runner image. Pinned to the version pcbkit's format numbers
+# were confirmed against, for the reason CR-004 gives: an unpinned toolchain
+# produces output that differs between machines and nobody notices until it
+# matters.
+KICAD_IMAGE = "kicad/kicad:10.0.5"
+
+# pcbkit is not on a package index yet, so a generated project fetches it from
+# source at the release that generated the project. If you track a branch
+# instead, change the ref here and in .github/workflows/checks.yml -- but then
+# the board's CI is no longer pinned, and a pcbkit change can alter the output
+# without the board changing.
+PCBKIT_SOURCE = f"git+https://github.com/BIOS9/agentic_pcb_toolkit@v{__version__}"
+
+_RUNNER = f"uvx --from {PCBKIT_SOURCE}"
+
+# CR-008's escape hatch, shared verbatim between this repository's own workflow
+# and every generated one -- `tests/test_scaffold.py` fails if the two copies
+# drift.
+#
+# A check may be knowingly red because the work is staged rather than broken:
+# the schematic gains a connector, the layout follows later, and DRC fails in
+# between. Blocking that is wrong and bypassing it quietly is worse, so the
+# deferral is declared in the pull request body and is machine-readable:
+#
+#     deferred: checks
+#     why: schematic adds the USB-C connector; layout lands in #42
+#     resolves: #42
+#
+# Three lines, because each carries information a bare override label does not:
+# which check, why, and what clears it.
+GATE_JOB = """\
+  # `checks` is deliberately *not* the required status context: a required
+  # context in GitHub is all-or-nothing, so a knowingly-red check could only be
+  # got past by an admin bypass -- the quiet override CR-008 rejects. `gate` is
+  # required instead, and it passes either because `checks` is green or because
+  # the pull request body declares the failure, says why, and names what
+  # resolves it.
+  gate:
+    needs: [checks]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a green check, or a declared deferral
+        env:
+          RESULT: ${{ needs.checks.result }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -uo pipefail
+
+          if [ "$RESULT" = "success" ]; then
+            echo "checks passed"
+            exit 0
+          fi
+
+          verdict=$(printf '%s\\n' "$BODY" | tr -d '\\r' | awk -v want=checks '
+            /^deferred:/ {
+              sub(/^deferred:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, "")
+              name = $0; why = ""; res = ""; next
+            }
+            /^why:/ {
+              if (name != "") { sub(/^why:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); why = $0 }
+              next
+            }
+            /^resolves:/ {
+              if (name == want) {
+                sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0
+                verdict = (why != "" && res ~ /^#?[0-9]+$/) ? "declared" : "malformed"
+                name = ""; exit
+              }
+              name = ""; next
+            }
+            # awk runs END even on exit, so the verdict is set once and printed
+            # once here. A block that names the check but stops short of
+            # resolves is malformed, not absent.
+            END {
+              if (verdict == "" && name == want) verdict = "malformed"
+              if (verdict != "") print verdict
+            }
+          ')
+
+          case "$verdict" in
+            declared)
+              echo "::warning::checks is '$RESULT' and deferred by declaration in the pull request body"
+              echo "Tracked debt, not a pass. An unresolved deferral is a finding at the fab gate."
+              exit 0 ;;
+            malformed)
+              echo "::error::the deferral for 'checks' is incomplete"
+              echo "::error::it needs all three lines: 'deferred: checks', a non-empty 'why:', and 'resolves: #<issue>'"
+              exit 1 ;;
+            *)
+              echo "::error::checks is '$RESULT' and no deferral declares it"
+              echo "::error::fix the check, or declare the deferral in the pull request body:"
+              echo "::error::  deferred: checks"
+              echo "::error::  why: <what is staged, and why this is not broken>"
+              echo "::error::  resolves: #<issue that clears it>"
+              exit 1 ;;
+          esac
+"""
+
+# Every command the generated workflow runs, as data rather than as a YAML
+# blob, so a test can assert each one is a verb the CLI actually has. The
+# defect CR-008 was raised over was a CI step that could not fail; a step that
+# cannot even run is the same failure one stage earlier.
+#
+# `{design}` expands to the starter design file. Each entry gates: no step is
+# here that exits 0 regardless of the board.
+CHECK_STEPS: tuple[tuple[str, str], ...] = (
+    ("Toolchain", "pcbkit doctor --strict"),
+    # The rules file is generated and gitignored (CR-005), so CI makes its own
+    # from the committed profile rather than trusting one in the tree.
+    ("Design rules from the profile", "pcbkit profile regenerate ."),
+    ("Build", "pcbkit build {design} --strict"),
+)
+
+
+def _workflow(name: str) -> str:
+    """The checks workflow for a generated project.
+
+    Deliberately not a copy of this repository's own workflow, which runs
+    through a Nix flake a board project does not have. Two things it must get
+    right or it emits a gate that cannot pass:
+
+    * KiCad 10 and its `pcbnew` module are not on the hosted runner image, so
+      the job runs inside the fabricator-independent KiCad container.
+    * pcbkit is not published, so it is fetched from source at the version that
+      generated this project. Pinned, for the same reason the profile is copied
+      rather than referenced.
+    """
+    steps = "\n".join(
+        f"      - name: {label}\n        run: {_RUNNER} {command.format(design=f'src/{name}.py')}"
+        for label, command in CHECK_STEPS
+    )
+    return f"""\
+name: checks
+
+# Generated by `pcbkit new`. Every verb exits 0 with findings and nonzero only
+# when a tool failed, so --strict is what turns a check into a gate.
+#
+# The container carries KiCad and pcbnew; uvx supplies pcbkit itself. Bump the
+# tag when you upgrade KiCad, and re-run the build before trusting the output:
+# a format-version change is a real difference, not noise.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `edited` matters: a deferral is declared in the pull request body, so
+    # editing the body must re-evaluate the gate.
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    container: {KICAD_IMAGE}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+{steps}
+
+{GATE_JOB}"""
+
+
+def _readme(name: str, profile: Profile, process_id: str) -> str:
+    """What the project is, how to check it, and what to enable by hand.
+
+    pcbkit cannot configure another account's repository, so the settings are
+    stated rather than pretended (CR-008).
+    """
+    commands = "\n".join(
+        f"$ {command.format(design=f'src/{name}.py')}" for _, command in CHECK_STEPS
+    )
+    contexts = "\n".join(f"   - `{context}`" for context in REQUIRED_CONTEXTS)
+    return f"""\
+# {name}
+
+A pcbkit board project. The circuit is Python under `src/`; everything KiCad
+reads is generated from it.
+
+```console
+{commands}
+```
+
+## What is committed, and what is not
+
+`pcbkit.toml`, `profiles/{profile.vendor.lower()}.yaml`, and `src/` are the
+project. Gerbers, renders, findings, and `{name}.kicad_dru` are generated from
+those, and `.gitignore` excludes them — regenerate them, never commit them.
+
+The fabricator profile is *copied* into this project rather than referenced by
+name, so a board revised in two years regenerates the same design rules.
+
+Fabricator: {profile.vendor}, process `{process_id}`.
+
+## Before you order
+
+`pcbkit doctor --strict` reports whether the toolchain is pinned. An unpinned
+build works; it is just not guaranteed to match another machine.
+
+## Continuous integration
+
+`.github/workflows/checks.yml` runs the same commands on every pull request,
+inside `{KICAD_IMAGE}` because KiCad 10 and its `pcbnew` module are not on a
+hosted runner image. pcbkit itself is pinned at `v{__version__}`, the release
+that generated this project — change the ref in that file to track something
+else, at the cost of a board whose CI result can change without the board
+changing.
+
+## Branch protection
+
+The workflow only reports — it does not block. Enabling that is an
+account-level change pcbkit cannot make for you.
+
+On `main`, in Settings → Branches → Add branch protection rule:
+
+1. Require a pull request before merging.
+2. Require status checks to pass, and require branches to be up to date.
+3. Select these contexts:
+{contexts}
+
+`gate` is produced by the generated workflow. `agent-review` is produced only if
+you add a review workflow of your own; drop it from the list if you are not
+running one. Requiring a context that nothing produces blocks every merge.
+
+Require `gate` rather than `checks` — see below.
+
+## Deferring a check, without bypassing it
+
+A check is sometimes knowingly red because the work is staged, not broken: the
+schematic gains a connector and the layout follows in a later change, so DRC
+fails in between. Blocking that is wrong; bypassing it quietly is worse.
+
+A required status context is all-or-nothing, so `gate` is the required one and
+`checks` is not. `gate` passes when `checks` is green, or when the pull request
+body declares the failure:
+
+```
+deferred: checks
+why: schematic adds the USB-C connector; layout lands in #42
+resolves: #42
+```
+
+Three lines, because each carries something a bare override label does not:
+which check, why, and what clears it. All three are required — an incomplete
+declaration fails the gate rather than passing it.
+
+A deferral is tracked debt, not a pass. It stays visible in the pull request
+list, and a board that reaches an order with one unresolved is a board whose
+checks nobody finished.
+
+An unreviewed board change becomes an unreviewed order, which is the point at
+which a mistake starts costing money.
+"""
+
+
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
@@ -127,6 +387,13 @@ def new_project(
 
     (directory / PROJECT_FILE).write_text(_project_toml(name, profile, process.id))
     (directory / ".gitignore").write_text(GITIGNORE)
+    (directory / "README.md").write_text(_readme(name, profile, process.id))
+
+    # CR-008: the workflow ships with the project, the branch protection it
+    # feeds is documented in the README because pcbkit cannot enable it.
+    workflows = directory / ".github" / "workflows"
+    workflows.mkdir(parents=True, exist_ok=True)
+    (workflows / "checks.yml").write_text(_workflow(name))
 
     dru_text = render(profile, process)
     dru_path = directory / f"{name}.kicad_dru"
