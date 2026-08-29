@@ -1,7 +1,7 @@
 # CR-006 — Manufacturing capabilities are design constraints
 
 Raised: 2026-08-29. Source: [#5](https://github.com/BIOS9/agentic_pcb_toolkit/issues/5).
-Status: proposed.
+Status: **accepted** 2026-08-29.
 
 ## Problem
 

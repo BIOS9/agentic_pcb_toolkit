@@ -67,6 +67,12 @@ A part resolves to a complete `(symbol, footprint, 3d, lcsc, stock)` tuple or it
 fails loudly with a finding. Guessing a footprint produces a board that fails at
 assembly, which is discovered after the money is spent.
 
+Selection is a ranked cost decision, and the ranking is **reported** — why the
+winner won, on availability, basic/extended classification, price at the stated
+quantity, and electrical fit. Stock must clear `max(quantity x margin, floor)`;
+a part that only just covers the build will be gone by order time. See
+[CR-007](docs/sdlc/CR-007-jlcpcb-assembly-default/).
+
 ### 7. No agent may be privileged
 
 pcbkit must work identically under any agent -- Claude Code, Codex, Cursor, a
@@ -110,6 +116,18 @@ committing the artifacts unnecessary.
 
 Run output goes to CI artifact storage, released output to a GitHub Release.
 See [CR-005](docs/sdlc/CR-005-no-build-artifacts/).
+
+### 10. Fabricator limits are profile data, never constants
+
+Never write a manufacturing limit into code. `MIN_TRACK_MM = 0.127` in an
+emitter is a bug: limits differ per fabricator, per layer count, and per copper
+weight, and they change. They live in a dated profile file, and the
+`.kicad_dru` is **generated** from it rather than transcribed.
+
+DRC runs against those rules from the first build, not at fab time. A violation
+caught while iterating digitally costs seconds; caught at order time it costs a
+respin; caught by the fab's own optimiser it may never be reported at all.
+See [CR-006](docs/sdlc/CR-006-fab-capabilities-as-drc/).
 
 ## Layout
 

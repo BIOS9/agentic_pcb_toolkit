@@ -1,7 +1,7 @@
 # CR-007 — Assembled JLCPCB order is the default target
 
 Raised: 2026-08-29. Source: [#6](https://github.com/BIOS9/agentic_pcb_toolkit/issues/6).
-Status: proposed.
+Status: **accepted** 2026-08-29.
 
 ## Problem
 
