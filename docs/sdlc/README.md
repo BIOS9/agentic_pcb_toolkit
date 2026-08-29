@@ -54,7 +54,9 @@ pcbkit may be agent-specific; pcbkit itself may not be.
 |---|---|---|
 | [M0](M0/) | shipped | Environment guard, CLI output contract |
 | [M1](M1/) | shipped | Circuit IR and capture DSL |
-| [M3](M3/spike.md) | spike done | `kicad-sch-api` writes KiCad 10 schematics — its subject is **M5** under the revised plan |
+| [M2](M2/) | shipped | Hermetic environment: Nix pin, toolchain provenance, licence audit |
+| [M3](M3/) | in progress | Project scaffold and fabricator profiles |
+| [M5](M5/spike.md) | spike done | `kicad-sch-api` writes KiCad 10 schematics |
 | [CR-001](CR-001-agent-neutral/) | accepted | No agent may be privileged |
 | [CR-002](CR-002-iterative-intent/) | accepted | Requirements are the entry point ([#1](https://github.com/BIOS9/agentic_pcb_toolkit/issues/1)) |
 | [CR-003](CR-003-open-source-only/) | accepted | Open-source toolchain only ([#2](https://github.com/BIOS9/agentic_pcb_toolkit/issues/2)) |
@@ -70,10 +72,12 @@ supersedes the original M0-M7 plan, which was approved before any change request
 existed and which the CRs moved enough to invalidate from M2 onward. M0 and M1
 shipped under the original and are unchanged.
 
-Milestone numbers are not stable across the re-plan: the schematic emitter was
-M3 in the original and is M5 now, which is why `M3/spike.md` reads as being
-about a milestone that no longer holds that number. The spike's conclusion still
-stands.
+Milestone numbers were not stable across the re-plan: the schematic emitter was
+M3 in the original and is M5 now. Its spike moved to `M5/` when M3 needed its
+own directory — a relocation by `git mv`, preserving content and history. The
+append-only rule protects decisions from being rewritten, not files from being
+filed correctly; leaving two unrelated milestones sharing one directory would
+have been the worse outcome.
 
 Several of these depend on each other. CR-005 relies on CR-004, because
 "regenerable, so do not commit it" is only a safe standard once regeneration is

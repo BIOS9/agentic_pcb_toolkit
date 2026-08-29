@@ -1,0 +1,83 @@
+# JLCPCB fabrication capability profile.
+#
+# Every number here is data, never code. See AGENTS.md rule 10.
+#
+# PROVENANCE: derived from a working 133-line JLCPCB `.kicad_dru` rule set, not
+# from scraping the vendor's capabilities page. That file was in production use,
+# which makes its numbers trustworthy as *practice*, but it is a secondary
+# source and may lag what JLCPCB currently publishes. `retrieved` is the date
+# this profile was written, not the date the vendor last changed anything.
+#
+# Verify against the source URL before an order that matters.
+
+vendor: JLCPCB
+source: https://jlcpcb.com/capabilities/pcb-capabilities
+retrieved: 2026-08-29
+derived_from: >-
+  A production KiCad 7 custom-rules file for a two-layer 1 oz board, including
+  its author's recorded uncertainties.
+
+processes:
+  - id: 2layer-1oz
+    description: Two-layer board, 1 oz outer copper. JLCPCB's default prototype process.
+    layers: 2
+    copper_oz: 1.0
+    limits:
+      # Track geometry. Outer and inner differ, which is why limits are keyed
+      # by process rather than being one flat list.
+      track_width_mm:    {outer: 0.127, inner: 0.09}
+      track_spacing_mm:  {outer: 0.127, inner: 0.09}
+
+      # Holes. The minimum is the one figure the source file flagged as
+      # ambiguous in JLCPCB's own documentation; see gaps below.
+      hole_diameter_mm:      {min: 0.2, max: 6.3}
+      npth_hole_min_mm:      0.5
+      castellated_hole_min_mm: 0.6
+      annular_ring_min_mm:   0.075
+      hole_to_hole_mm:       {different_nets: 0.5, same_net: 0.254}
+
+      # Clearances.
+      track_to_npth_mm:      0.254
+      track_to_pth_mm:       0.33
+      track_to_pad_mm:       0.2
+      pad_to_pad_mm:         0.127
+      edge_clearance_mm:     0.3
+      edge_clearance_vcut_mm: 0.4
+
+      # Silkscreen.
+      silk_thickness_min_mm: 0.15
+      silk_height_min_mm:    1.0
+      pad_to_silk_mm:        0.15
+
+      # Slots, from the source file's documented TODOs.
+      slot_width_mm:         {plated: 0.5, unplated: 1.0}
+
+      # Board.
+      board_min_size_mm:     {x: 10.0, y: 10.0}
+
+# Limits known to exist that this profile does not turn into design rules.
+# Tracked rather than silent: the source file lost three of these to TODO
+# comments, which is exactly the failure CR-006 exists to prevent.
+gaps:
+  - id: npth_pad_margin
+    why: >-
+      A pad around an NPTH hole should be 0.4-0.5 mm larger than the drill.
+      JLCPCB digs out 0.2-0.25 mm of surrounding copper otherwise, and the hole
+      may become plated. Needs a rule relating pad size to drill size, which the
+      source file's author could not express.
+    encoded: false
+  - id: hole_to_edge
+    why: >-
+      Hole to board edge should be at least 1 mm. Not expressible as a simple
+      clearance constraint against the edge cut.
+    encoded: false
+  - id: min_hole_ambiguity
+    why: >-
+      The vendor's published minimum hole size is inconsistent: an illustration
+      shows 0.2 mm, the text says 0.3 mm for 1-2 layer, and multilayer is
+      described as "0.15 mm more costly". This profile encodes the permissive
+      0.2 mm, which may pass DRC on a board the fab then queries.
+    encoded: partial
+  - id: impedance_control
+    why: Controlled-impedance stackups are a separate JLCPCB service, not yet modelled.
+    encoded: false

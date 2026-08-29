@@ -9,6 +9,7 @@ dependencies = [
     # Schematic writer. Emits the KiCad 9 format, so the emitter always follows
     # it with `kicad-cli sch upgrade` -- see docs/sdlc/M3/spike.md.
     "kicad-sch-api>=0.5.5",
+    "pyyaml>=6.0.3",
 ]
 
 [project.scripts]
