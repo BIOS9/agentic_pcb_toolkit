@@ -47,6 +47,18 @@ jobs:
           fi
 
           verdict=$(printf '%s\n' "$BODY" | tr -d '\r' | awk -v want=checks '
+            # A declaration is prose at column 0, not an example. Fenced blocks
+            # and HTML comments both put text at column 0, and this syntax
+            # appears inside both in the documentation that teaches it -- so a
+            # pull request quoting its own README would otherwise defer its own
+            # checks, and one hiding the block in a comment would defer them
+            # with nothing visible on the page. Skipping these regions is the
+            # difference between a declaration and a mention.
+            /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+            fence { next }
+            /<!--/ { comment = 1 }
+            comment { if (/-->/) comment = 0; next }
+
             /^deferred:/ {
               sub(/^deferred:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, "")
               name = $0; why = ""; res = ""; next
@@ -56,18 +68,19 @@ jobs:
               next
             }
             /^resolves:/ {
-              if (name == want) {
-                sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0
-                verdict = (why != "" && res ~ /^#?[0-9]+$/) ? "declared" : "malformed"
-                name = ""; exit
-              }
-              name = ""; next
+              if (name != "") { sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0 }
+              next
             }
-            # awk runs END even on exit, so the verdict is set once and printed
-            # once here. A block that names the check but stops short of
-            # resolves is malformed, not absent.
+            # Evaluated once the block is complete rather than on a fixed field
+            # order, so `resolves:` before `why:` is the same declaration. An
+            # issue number must be a real one: `#0` names nothing, and a
+            # deferral that tracks nothing is not tracked debt.
+            name == want && why != "" && res ~ /^#?[1-9][0-9]*$/ { verdict = "declared"; exit }
             END {
-              if (verdict == "" && name == want) verdict = "malformed"
+              if (verdict == "") {
+                if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) verdict = "declared"
+                else if (name == want) verdict = "malformed"
+              }
               if (verdict != "") print verdict
             }
           ')
@@ -80,6 +93,7 @@ jobs:
             malformed)
               echo "::error::the deferral for 'checks' is incomplete"
               echo "::error::it needs all three lines: 'deferred: checks', a non-empty 'why:', and 'resolves: #<issue>'"
+              echo "::error::order does not matter; a block inside a code fence or an HTML comment does not count"
               exit 1 ;;
             *)
               echo "::error::checks is '$RESULT' and no deferral declares it"
@@ -87,5 +101,6 @@ jobs:
               echo "::error::  deferred: checks"
               echo "::error::  why: <what is staged, and why this is not broken>"
               echo "::error::  resolves: #<issue that clears it>"
+              echo "::error::at the start of a line, not inside a code fence or an HTML comment"
               exit 1 ;;
           esac

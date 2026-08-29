@@ -43,10 +43,11 @@ VERDICT: APPROVE WITH COMMENTS    -> success
 VERDICT: REQUEST CHANGES          -> failure
 ```
 
-and carries, anywhere in the body, the commit it actually read:
+and carries, anywhere in the body, the commit it actually read — the **full
+forty characters**:
 
 ```
-reviewed: 7e5cd02
+reviewed: 7e5cd02f1a4b9c3d5e8f0a2b4c6d8e0f1a3b5c7d
 ```
 
 Anchoring to the last line matters because an unanchored search lets a
@@ -74,6 +75,17 @@ required check goes missing and the merge blocks until the new code is reviewed;
 no separate dismissal rule is needed, and a verdict cannot be replayed onto code
 it did not review.
 
+An abbreviated SHA is not accepted. Seven hex characters is 2^28, and grinding
+a commit to a chosen short prefix is minutes of off-the-shelf work — enough to
+reopen the same force-push replay against a crafted head. The comparison is
+equality on the full hash, case-normalised.
+
+A comment whose `reviewed:` line does not name the current head is not about
+this commit, so it records nothing at all: it neither approves nor clears. Only
+once the SHA matches does a later failure — a malformed verdict line, an API
+error — record `error`. Without that ordering, a comment merely quoting the
+syntax could wipe a legitimate approval off unchanged code.
+
 ### Who may post a verdict
 
 The job filters on `author_association` to keep a passer-by on a public
@@ -86,6 +98,17 @@ and triage invitations and `MEMBER` is org membership; neither implies the
 ability to push. This repository is public, so the difference is the whole
 control: without it an account trusted only to read could turn its own pull
 request green.
+
+If that endpoint is not readable by `GITHUB_TOKEN`, the guard falls back to
+requiring `OWNER` — the account that owns the repository, which is the one
+association that does imply control of it. Failing closed instead would leave
+`main` permanently unmergeable with nothing on the page saying why, because an
+`issue_comment` run does not appear in a pull request's checks list. The
+fallback never accepts a weaker claim than the check it replaces.
+
+**Smoke-test this before enabling protection.** Post a throwaway verdict comment
+on an open pull request and watch the run. A guard that cannot read the endpoint
+and an author who is not `OWNER` is a deadlock discovered at the worst moment.
 
 ### Failures must be visible
 
@@ -159,8 +182,23 @@ resolves: #42
 
 A declaration names the check, the reason, and what clears it. A bare override
 label would record that someone wanted to merge, which is not information. All
-three lines are required: an incomplete declaration fails the gate rather than
-passing it, so a half-written deferral cannot succeed by looking like one.
+three lines are required, in any order: an incomplete declaration fails the gate
+rather than passing it, so a half-written deferral cannot succeed by looking
+like one. `resolves:` must name a real issue — `#0` tracks nothing.
+
+### A mention is not a declaration
+
+Each line must start at the beginning of a line, and a block inside a **code
+fence** or an **HTML comment** does not count.
+
+Both exclusions are load-bearing rather than tidy. The three-line block appears
+inside a fence in this specification and in the README `pcbkit new` emits, so
+without the first, a pull request that quoted its own documentation would defer
+its own checks. And without the second, a deferral could be hidden in an HTML
+comment: the rendered body would show an ordinary description and no deferral at
+all, which is exactly the override taken quietly that `intent.md` rejects. The
+declaration has to be visible to the person reading the pull request, or it is
+not a record.
 
 ### Why `gate` is the required context and `checks` is not
 
@@ -241,15 +279,19 @@ rather than glossed over.
 
 - `main` rejects a direct push.
 - `gate` fails when `checks` is red and nothing declares it, and passes when a
-  complete `deferred:` block names it. An incomplete block fails.
+  complete `deferred:` block names it, in either field order. An incomplete
+  block fails, and a block inside a code fence or an HTML comment does not
+  declare anything.
 - A comment whose last line is `VERDICT: APPROVE` and which names the head
   commit sets the `agent-review` status on that SHA; pushing a further commit
   clears it, and editing the old comment does not restore it.
-- A verdict naming a commit that is no longer head is refused.
+- A verdict naming a commit that is no longer head is refused, and records
+  nothing against the head it did not review. An abbreviated SHA is refused.
 - A verdict from an account without push permission is refused — checked
   against the repository's collaborator permission, not `author_association`.
-- A verdict that fails to record leaves `error` on the context rather than an
-  earlier success.
+- A verdict *for the current head* that fails to record leaves `error` on the
+  context rather than an earlier success. A comment that merely mentions the
+  syntax leaves the context untouched.
 - A review by an agent that did not author the change is recorded on the PR.
 - `pcbkit new` emits a checks workflow whose every command is a real CLI verb,
   and a README naming the settings to enable and how to declare a deferral.

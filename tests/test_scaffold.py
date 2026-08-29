@@ -199,22 +199,23 @@ def test_generated_ci_runs_only_verbs_the_cli_actually_has():
     from pcbkit.cli import build_parser
 
     parser = build_parser()
-    for label, command in scaffold.CHECK_STEPS:
-        argv = shlex.split(command.format(design="src/demo.py"))
-        assert argv[0] == "pcbkit", f"{label}: not a pcbkit invocation"
+    for step in scaffold.CHECK_STEPS:
+        argv = shlex.split(step.command.format(design="src/demo.py"))
+        assert argv[0] == "pcbkit", f"{step.label}: not a pcbkit invocation"
         try:
             parser.parse_args(argv[1:])
         except SystemExit as exc:  # argparse exits rather than raising
-            pytest.fail(f"{label}: `{command}` is not a valid pcbkit invocation ({exc})")
+            pytest.fail(f"{step.label}: `{step.command}` is not valid pcbkit ({exc})")
 
 
-def test_generated_ci_gates_rather_than_reports(tmp_path):
-    """Every step must be able to fail. `--strict` is what turns pcbkit's
-    findings-are-data contract into a gate (AGENTS.md rule 3); a step without it
-    has to be one whose nonzero exit means a tool failed."""
-    gating = {"--strict", "regenerate"}
-    for label, command in scaffold.CHECK_STEPS:
-        assert gating & set(command.split()), f"{label}: `{command}` cannot fail"
+def test_at_least_one_ci_step_can_fail_on_a_bad_board():
+    """A workflow of setup steps is a report, not a gate. `--strict` is what
+    turns pcbkit's findings-are-data contract into one (AGENTS.md rule 3), so
+    every step claiming to gate must carry it -- and something must claim to."""
+    gating = [step for step in scaffold.CHECK_STEPS if step.gates]
+    assert gating, "no step in the generated workflow can fail on a bad board"
+    for step in gating:
+        assert "--strict" in step.command, f"{step.label}: gates without --strict"
 
 
 def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
@@ -225,18 +226,21 @@ def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
 
     assert f"container: {scaffold.KICAD_IMAGE}" in workflow
     assert "pull_request:" in workflow
-    for _, command in scaffold.CHECK_STEPS:
-        assert command.format(design="src/demo.py") in workflow
+    for step in scaffold.CHECK_STEPS:
+        assert step.command.format(design="src/demo.py") in workflow
 
 
-def test_generated_ci_pins_pcbkit(tmp_path):
+def test_generated_ci_pins_pcbkit_and_kicad(tmp_path):
     """CR-004: an unpinned toolchain gives a board whose CI result can change
     without the board changing."""
     new_project(tmp_path / "demo")
     workflow = (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
     assert f"@v{__version__}" in workflow
-    assert scaffold.KICAD_IMAGE.count(":") == 1, "image tag must be pinned, not latest"
     assert not scaffold.KICAD_IMAGE.endswith(("latest", "nightly"))
+    # One version, one place. AGENTS.md rule 4 pins the file formats against a
+    # specific KiCad; a container tag that drifts from it would run the
+    # emitters against a KiCad those numbers were never confirmed on.
+    assert scaffold.KICAD_IMAGE.endswith(f":{kicad.CONFIRMED_KICAD_VERSION}")
 
 
 def test_generated_workflow_is_valid_yaml(tmp_path):
@@ -270,24 +274,47 @@ def test_the_gate_job_has_exactly_one_definition():
     "body,expected",
     [
         ("deferred: checks\nwhy: layout lands later\nresolves: #42\n", "declared"),
+        # Field order is not load-bearing; requiring one would be a rule the
+        # error message does not state.
+        ("deferred: checks\nresolves: #42\nwhy: staged\n", "declared"),
         # CRLF: GitHub delivers pull request bodies with Windows line endings.
         ("prose\r\n\r\ndeferred: checks\r\nwhy: staged\r\nresolves: #42\r\n", "declared"),
         ("deferred: checks\nwhy: staged\nresolves: 42\n", "declared"),
-        # Each missing field is a malformed declaration, not an absent one:
-        # someone tried to defer and the gate must say why it did not take.
+        # A quoted example is a mention, not a declaration. This exact block
+        # appears inside a fence in the README pcbkit generates, so without
+        # this any pull request quoting its own docs would defer its own checks.
+        (
+            "Docs example:\n\n```\ndeferred: checks\nwhy: schematic adds USB-C\n"
+            "resolves: #42\n```\n",
+            "",
+        ),
+        ("~~~\ndeferred: checks\nwhy: x\nresolves: #42\n~~~\n", ""),
+        # And a hidden one is the quiet override the three lines exist to stop:
+        # the rendered body would show a one-line description and no deferral.
+        (
+            "Small cleanup.\n\n<!--\ndeferred: checks\nwhy: flaky runner\n"
+            "resolves: #1\n-->\n",
+            "",
+        ),
+        ("<!-- deferred: checks -->\nwhy: x\nresolves: #1\n", ""),
+        # A real declaration after a quoted one still counts.
+        (
+            "```\ndeferred: checks\nwhy: example\nresolves: #9\n```\n\n"
+            "deferred: checks\nwhy: the real one\nresolves: #42\n",
+            "declared",
+        ),
+        # Each missing or empty field is a malformed declaration, not an absent
+        # one: someone tried to defer and the gate must say why it did not take.
         ("deferred: checks\nresolves: #42\n", "malformed"),
         ("deferred: checks\nwhy:\nresolves: #42\n", "malformed"),
         ("deferred: checks\nwhy: staged\nresolves: later\n", "malformed"),
         ("deferred: checks\nwhy: staged\n", "malformed"),
+        # #0 names no issue, so it tracks nothing.
+        ("deferred: checks\nwhy: staged\nresolves: #0\n", "malformed"),
         # A deferral of some other check does not excuse this one.
         ("deferred: drc\nwhy: staged\nresolves: #42\n", ""),
         ("an ordinary pull request body\n", ""),
-        # Indented, so it is prose or a quoted example rather than a declaration.
         ("  deferred: checks\n  why: x\n  resolves: #42\n", ""),
-        (
-            "deferred: drc\nwhy: a\nresolves: #1\ndeferred: checks\nwhy: b\nresolves: #2\n",
-            "declared",
-        ),
     ],
 )
 def test_deferral_parser(body, expected, tmp_path):
@@ -324,12 +351,20 @@ def test_readme_names_the_settings_pcbkit_cannot_enable(tmp_path):
     assert "Require a pull request before merging" in readme
     # The reader must be told the workflow alone blocks nothing.
     assert "does not block" in readme
-    # And which of the two contexts nothing in the project produces.
-    assert "agent-review` is produced only" in readme
+
+    # Requiring a context nothing produces blocks every merge, so the caveat
+    # has to come before the list a reader is about to act on -- not after it.
+    caveat = readme.index("only if you add a review workflow of your own")
+    numbered = readme.index("1. Require a pull request before merging")
+    assert caveat < numbered, "the caveat must precede the settings it qualifies"
+
     # The escape hatch has to be documented where someone hitting a red check
     # will look, or they will reach for an admin bypass instead.
     assert "deferred: checks" in readme
     assert "resolves: #42" in readme
+    # Including the two rules a reader cannot infer from the example.
+    assert "order does not matter" in readme
+    assert "code fence" in readme
 
 
 def test_generated_project_documents_what_is_not_committed(tmp_path):

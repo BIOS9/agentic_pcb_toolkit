@@ -11,8 +11,10 @@ import datetime as _dt
 import re
 import tomllib
 from pathlib import Path
+from typing import NamedTuple
 
 from pcbkit import __version__
+from pcbkit.core.kicad import CONFIRMED_KICAD_VERSION
 from pcbkit.core.result import Envelope, Finding, Severity
 from pcbkit.profile import DEFAULT_PROFILE, Profile, ProfileError, load
 from pcbkit.profile.dru import digest, render
@@ -44,7 +46,12 @@ REQUIRED_CONTEXTS = ("gate", "agent-review")
 # were confirmed against, for the reason CR-004 gives: an unpinned toolchain
 # produces output that differs between machines and nobody notices until it
 # matters.
-KICAD_IMAGE = "kicad/kicad:10.0.5"
+#
+# The tag was confirmed to exist on the registry on 2026-08-29. A generated
+# workflow whose container does not resolve is a gate that cannot pass, which
+# is the same failure as naming a verb that does not exist -- so re-confirm it
+# when CONFIRMED_KICAD_VERSION moves.
+KICAD_IMAGE = f"kicad/kicad:{CONFIRMED_KICAD_VERSION}"
 
 # pcbkit is not on a package index yet, so a generated project fetches it from
 # source at the release that generated the project. If you track a branch
@@ -95,6 +102,18 @@ GATE_JOB = """\
           fi
 
           verdict=$(printf '%s\\n' "$BODY" | tr -d '\\r' | awk -v want=checks '
+            # A declaration is prose at column 0, not an example. Fenced blocks
+            # and HTML comments both put text at column 0, and this syntax
+            # appears inside both in the documentation that teaches it -- so a
+            # pull request quoting its own README would otherwise defer its own
+            # checks, and one hiding the block in a comment would defer them
+            # with nothing visible on the page. Skipping these regions is the
+            # difference between a declaration and a mention.
+            /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+            fence { next }
+            /<!--/ { comment = 1 }
+            comment { if (/-->/) comment = 0; next }
+
             /^deferred:/ {
               sub(/^deferred:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, "")
               name = $0; why = ""; res = ""; next
@@ -104,18 +123,19 @@ GATE_JOB = """\
               next
             }
             /^resolves:/ {
-              if (name == want) {
-                sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0
-                verdict = (why != "" && res ~ /^#?[0-9]+$/) ? "declared" : "malformed"
-                name = ""; exit
-              }
-              name = ""; next
+              if (name != "") { sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0 }
+              next
             }
-            # awk runs END even on exit, so the verdict is set once and printed
-            # once here. A block that names the check but stops short of
-            # resolves is malformed, not absent.
+            # Evaluated once the block is complete rather than on a fixed field
+            # order, so `resolves:` before `why:` is the same declaration. An
+            # issue number must be a real one: `#0` names nothing, and a
+            # deferral that tracks nothing is not tracked debt.
+            name == want && why != "" && res ~ /^#?[1-9][0-9]*$/ { verdict = "declared"; exit }
             END {
-              if (verdict == "" && name == want) verdict = "malformed"
+              if (verdict == "") {
+                if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) verdict = "declared"
+                else if (name == want) verdict = "malformed"
+              }
               if (verdict != "") print verdict
             }
           ')
@@ -128,6 +148,7 @@ GATE_JOB = """\
             malformed)
               echo "::error::the deferral for 'checks' is incomplete"
               echo "::error::it needs all three lines: 'deferred: checks', a non-empty 'why:', and 'resolves: #<issue>'"
+              echo "::error::order does not matter; a block inside a code fence or an HTML comment does not count"
               exit 1 ;;
             *)
               echo "::error::checks is '$RESULT' and no deferral declares it"
@@ -135,6 +156,7 @@ GATE_JOB = """\
               echo "::error::  deferred: checks"
               echo "::error::  why: <what is staged, and why this is not broken>"
               echo "::error::  resolves: #<issue that clears it>"
+              echo "::error::at the start of a line, not inside a code fence or an HTML comment"
               exit 1 ;;
           esac
 """
@@ -144,14 +166,25 @@ GATE_JOB = """\
 # defect CR-008 was raised over was a CI step that could not fail; a step that
 # cannot even run is the same failure one stage earlier.
 #
-# `{design}` expands to the starter design file. Each entry gates: no step is
-# here that exits 0 regardless of the board.
-CHECK_STEPS: tuple[tuple[str, str], ...] = (
-    ("Toolchain", "pcbkit doctor --strict"),
-    # The rules file is generated and gitignored (CR-005), so CI makes its own
-    # from the committed profile rather than trusting one in the tree.
-    ("Design rules from the profile", "pcbkit profile regenerate ."),
-    ("Build", "pcbkit build {design} --strict"),
+# `{design}` expands to the starter design file. `gates` says whether the step
+# can fail on a bad board, as opposed to only on a broken tool -- recorded per
+# step rather than inferred from the command, because inferring it is how a
+# test comes to assert its own comment.
+class Step(NamedTuple):
+    label: str
+    command: str
+    gates: bool
+
+
+CHECK_STEPS: tuple[Step, ...] = (
+    # Setup, not a gate: it fails only if the toolchain itself is broken.
+    Step("Toolchain", "pcbkit doctor --strict", gates=False),
+    # Also setup. The rules file is generated and gitignored (CR-005), so CI
+    # makes its own from the committed profile rather than trusting one in the
+    # tree. It exits 0 for any well-formed project.
+    Step("Design rules from the profile", "pcbkit profile regenerate .", gates=False),
+    # The gate. This is the step a bad board fails.
+    Step("Build", "pcbkit build {design} --strict", gates=True),
 )
 
 
@@ -169,8 +202,8 @@ def _workflow(name: str) -> str:
       rather than referenced.
     """
     steps = "\n".join(
-        f"      - name: {label}\n        run: {_RUNNER} {command.format(design=f'src/{name}.py')}"
-        for label, command in CHECK_STEPS
+        f"      - name: {step.label}\n        run: {_RUNNER} {step.command.format(design=f'src/{name}.py')}"
+        for step in CHECK_STEPS
     )
     return f"""\
 name: checks
@@ -210,7 +243,7 @@ def _readme(name: str, profile: Profile, process_id: str) -> str:
     stated rather than pretended (CR-008).
     """
     commands = "\n".join(
-        f"$ {command.format(design=f'src/{name}.py')}" for _, command in CHECK_STEPS
+        f"$ {step.command.format(design=f'src/{name}.py')}" for step in CHECK_STEPS
     )
     contexts = "\n".join(f"   - `{context}`" for context in REQUIRED_CONTEXTS)
     return f"""\
@@ -253,18 +286,19 @@ changing.
 The workflow only reports — it does not block. Enabling that is an
 account-level change pcbkit cannot make for you.
 
+Requiring a context that nothing produces blocks every merge, so read this
+before you select any: `gate` is produced by the generated workflow, and
+`agent-review` is produced **only if you add a review workflow of your own**.
+If you are not running one, leave `agent-review` out of step 3.
+
+Require `gate` rather than `checks` — see the next section for why.
+
 On `main`, in Settings → Branches → Add branch protection rule:
 
 1. Require a pull request before merging.
 2. Require status checks to pass, and require branches to be up to date.
 3. Select these contexts:
 {contexts}
-
-`gate` is produced by the generated workflow. `agent-review` is produced only if
-you add a review workflow of your own; drop it from the list if you are not
-running one. Requiring a context that nothing produces blocks every merge.
-
-Require `gate` rather than `checks` — see below.
 
 ## Deferring a check, without bypassing it
 
@@ -284,7 +318,13 @@ resolves: #42
 
 Three lines, because each carries something a bare override label does not:
 which check, why, and what clears it. All three are required — an incomplete
-declaration fails the gate rather than passing it.
+declaration fails the gate rather than passing it. Their order does not matter.
+
+Each must start at the beginning of a line, and **a block inside a code fence
+or an HTML comment does not count**. Otherwise a pull request that quoted this
+README would defer its own checks, and one that hid the block in a comment
+would defer them with nothing visible on the page — which is the quiet override
+the three lines exist to prevent.
 
 A deferral is tracked debt, not a pass. It stays visible in the pull request
 list, and a board that reaches an order with one unresolved is a board whose

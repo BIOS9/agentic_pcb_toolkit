@@ -15,6 +15,7 @@ on:
     types: [created, edited]
 
 permissions:
+  contents: read
   statuses: write
   pull-requests: read
 
@@ -36,6 +37,7 @@ jobs:
     if: >-
       github.event.issue.pull_request &&
       contains(github.event.comment.body, 'VERDICT:') &&
+      contains(github.event.comment.body, 'reviewed:') &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     steps:
@@ -48,18 +50,35 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.event.comment.user.login }}
+          ASSOCIATION: ${{ github.event.comment.author_association }}
         run: |
-          set -euo pipefail
-          permission=$(gh api \
-            "repos/${{ github.repository }}/collaborators/$ACTOR/permission" \
-            --jq .permission)
-          case "$permission" in
-            admin|write|maintain)
-              echo "verdict accepted from $ACTOR ($permission)" ;;
-            *)
-              echo "::error::verdict from '$ACTOR' ignored; has '$permission', needs write"
-              exit 1 ;;
-          esac
+          set -uo pipefail
+          if permission=$(gh api \
+              "repos/${{ github.repository }}/collaborators/$ACTOR/permission" \
+              --jq .permission 2>/dev/null); then
+            case "$permission" in
+              admin|write|maintain)
+                echo "verdict accepted from $ACTOR ($permission)"
+                exit 0 ;;
+              *)
+                echo "::error::verdict from '$ACTOR' ignored; has '$permission', needs write"
+                exit 1 ;;
+            esac
+          fi
+
+          # The endpoint can be unavailable to GITHUB_TOKEN depending on how
+          # the repository is configured. Failing closed here would deadlock
+          # `main` permanently and invisibly, because an issue_comment run does
+          # not appear in the pull request's checks list. Falling back to OWNER
+          # keeps the mechanism working without ever accepting a weaker claim:
+          # OWNER is the account that owns the repository, unlike COLLABORATOR
+          # which covers read-only invitations.
+          if [ "$ASSOCIATION" = "OWNER" ]; then
+            echo "::warning::could not read collaborator permission; accepting OWNER $ACTOR"
+            exit 0
+          fi
+          echo "::error::could not read collaborator permission for '$ACTOR', and they are not OWNER"
+          exit 1
 
       - name: Resolve the head commit
         id: pr
@@ -77,9 +96,39 @@ jobs:
           BODY: ${{ github.event.comment.body }}
           HEAD_SHA: ${{ steps.pr.outputs.sha }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # GitHub delivers comment bodies with CRLF line endings.
           body=$(printf '%s' "$BODY" | tr -d '\r')
+
+          # Which commit does this verdict claim to be about? Answered before
+          # anything else, because a verdict about some other commit must not
+          # touch this one's status -- not even to report its own failure.
+          #
+          # The full 40 characters, compared for equality. An abbreviated
+          # prefix is not enough: seven hex characters is 2^28, and grinding a
+          # commit to a chosen short prefix is minutes of off-the-shelf work.
+          # That would reopen the exact replay this binding exists to close --
+          # prepare a benign A and a malicious B sharing a prefix, get A
+          # reviewed, then force-push B before the comment lands.
+          reviewed=$(printf '%s\n' "$body" \
+            | grep -oiE '^reviewed:[[:space:]]*[0-9a-f]{40}([[:space:]]|$)' \
+            | tail -1 | grep -oiE '[0-9a-f]{40}' | tr 'A-F' 'a-f')
+          head_sha=$(printf '%s' "$HEAD_SHA" | tr 'A-F' 'a-f')
+
+          if [ -z "$reviewed" ]; then
+            echo "::error::verdict has no 'reviewed: <sha>' line naming the commit it reviewed"
+            echo "::error::it must be the full 40-character commit hash"
+            exit 1
+          fi
+          if [ "$reviewed" != "$head_sha" ]; then
+            echo "::error::verdict reviewed $reviewed, but head is $head_sha"
+            echo "::error::the branch moved; review the new commit"
+            exit 1
+          fi
+
+          # From here the comment is definitely about the current head, so a
+          # failure below is worth recording against it.
+          echo "targeted=1" >> "$GITHUB_OUTPUT"
 
           # Anchored to the start of a line, and it must be the last non-empty
           # line of the comment. An unanchored search lets a postscript after
@@ -96,21 +145,6 @@ jobs:
               echo "::error::got: $last"
               exit 1 ;;
           esac
-
-          # The verdict must name the commit it reviewed. This is what makes a
-          # verdict unreplayable: editing an old approving comment re-runs this
-          # workflow, and without the binding it would re-stamp whatever head
-          # happens to be current -- silently un-dismissing a stale approval.
-          reviewed=$(printf '%s\n' "$body" | grep -oiE '^reviewed:[[:space:]]*[0-9a-f]{7,40}' | tail -1 | grep -oE '[0-9a-f]{7,40}' || true)
-          if [ -z "$reviewed" ]; then
-            echo "::error::verdict has no 'reviewed: <sha>' line naming the commit it reviewed"
-            exit 1
-          fi
-          if [ "${HEAD_SHA#"$reviewed"}" = "$HEAD_SHA" ]; then
-            echo "::error::verdict reviewed $reviewed, but head is $HEAD_SHA"
-            echo "::error::the branch moved; review the new commit"
-            exit 1
-          fi
 
           echo "state=$state" >> "$GITHUB_OUTPUT"
           echo "desc=$desc" >> "$GITHUB_OUTPUT"
@@ -129,10 +163,15 @@ jobs:
 
       - name: Report a failure that would otherwise be invisible
         # An issue_comment run does not appear in the pull request's checks
-        # list, so without this a malformed or stale verdict fails silently and
-        # an earlier success keeps standing. Only reached once the permission
-        # guard has passed, so an untrusted comment cannot clear a status.
-        if: failure() && steps.guard.outcome == 'success' && steps.pr.outputs.sha != ''
+        # list, so without this a malformed verdict fails silently and an
+        # earlier success keeps standing.
+        #
+        # Only for a comment that named the current head. A verdict about an
+        # older commit, or a comment that merely mentions the syntax, must not
+        # be able to clear a legitimate status on code it was not about.
+        if: >-
+          failure() && steps.guard.outcome == 'success' &&
+          steps.pr.outputs.sha != '' && steps.verdict.outputs.targeted == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
