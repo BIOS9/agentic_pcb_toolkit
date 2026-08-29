@@ -26,6 +26,27 @@ Three things follow, none of which the plan covers:
    connector faces the wrong way. That discovery must flow back into the
    requirements and go round again, not be patched into the design source.
 
+## Not all iterations cost the same
+
+"Iterate" hides a cost difference of three or four orders of magnitude, and
+treating it as one loop would be a design error.
+
+A **digital** iteration -- regenerate the board, render it, look at the
+schematic, check it fits the stated enclosure -- costs seconds and nothing.
+A **physical** iteration -- order from JLCPCB, wait, assemble, bring it up --
+costs real money and one to several weeks, and cannot be undone.
+
+Most of what a first physical board teaches is discoverable without ordering
+it. That the connector faces the wrong way, that the silkscreen is unreadable,
+that it is 4 mm too wide for the enclosure, that the BOM is over budget: all of
+that is visible in a render, a schematic PDF, a dimension check, and a costed
+BOM.
+
+So the purpose of the digital loop is not merely "build it". It is to surface
+everything a physical board would have taught, *before* paying for one. Every
+requirement discovered digitally is money and weeks saved, and the measure of
+this toolkit is how few physical iterations a working board takes.
+
 ## Outcome
 
 An author states intent; pcbkit reports what is unanswered; the author (or an
@@ -52,6 +73,9 @@ decision, so it is filed as a CR rather than a new milestone.
   nothing; unanswered items need defaults and a recorded assumption.
 - Dropping straight to the DSL must stay fully supported. Requirements are a
   layer above it, not a gate in front of it.
+- The user must always know which loop they are in. Presenting a free
+  regeneration and a $90 order as the same action would be a serious failure of
+  the interface.
 
 ## Scope
 
