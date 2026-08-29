@@ -1,0 +1,15 @@
+{
+  "assembly": true,
+  "classification": "basic",
+  "description": "Linear Voltage Regulators (LDO)",
+  "fetched": "2026-08-29",
+  "lcsc": "C6186",
+  "manufacturer": "Advanced Monolithic Systems",
+  "min_qty": 5,
+  "mpn": "AMS1117-3.3",
+  "package": "SOT-223-3_L6.5-W3.4-P2.30-LS7.0-BR",
+  "price": 0.1231,
+  "source": "easyeda",
+  "step_qty": 5,
+  "stock": 222228
+}

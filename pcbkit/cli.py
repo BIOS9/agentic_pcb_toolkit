@@ -18,6 +18,12 @@ from pcbkit.core.scaffold import (
     new_project,
     regenerate_design_rules,
 )
+from pcbkit.parts import cache as parts_cache
+from pcbkit.parts.cost import CostModel, suggest_substitution
+from pcbkit.parts.index import build_index
+from pcbkit.parts.lcsc import FetchError, fetch
+from pcbkit.parts.models import Candidate, PartRequest
+from pcbkit.parts.resolver import rank, resolve_design
 from pcbkit.profile import DEFAULT_PROFILE, ProfileError, available, load
 from pcbkit.profile.dru import render
 from pcbkit.core.result import Envelope
@@ -123,6 +129,109 @@ def cmd_profile(args: argparse.Namespace) -> int:
     return 0 if envelope.ok else 1
 
 
+def cmd_parts(args: argparse.Namespace) -> int:
+    if args.action == "index":
+        index = build_index()
+        envelope = Envelope(command="parts index", data=index.counts)
+
+    elif args.action == "fetch":
+        fetched, errors = [], []
+        for lcsc in args.args:
+            try:
+                sourcing = fetch(lcsc)
+                parts_cache.put(sourcing)
+                fetched.append(sourcing.model_dump(mode="json"))
+            except FetchError as exc:
+                errors.append(str(exc))
+        envelope = Envelope(
+            command="parts fetch",
+            ok=not errors or bool(fetched),
+            data={"fetched": fetched, "cached": parts_cache.entries()},
+            errors=errors,
+        )
+
+    elif args.action == "pick":
+        # Ranks what is already cached. Choosing between parts must not require
+        # the network (CR-003); `parts fetch` is the only networked verb.
+        term = " ".join(args.args).lower()
+        candidates = []
+        for lcsc in parts_cache.entries():
+            sourcing = parts_cache.get(lcsc)
+            haystack = " ".join(
+                [sourcing.mpn, sourcing.description, sourcing.package, sourcing.lcsc]
+            ).lower()
+            if not term or term in haystack:
+                candidates.append(
+                    Candidate(sourcing=sourcing, symbol="?", footprint="?")
+                )
+        request = PartRequest(part=term or None, quantity=args.quantity)
+        ranked = rank(candidates, request, CostModel())
+        envelope = Envelope(
+            command="parts pick",
+            data={
+                "query": term,
+                "quantity": args.quantity,
+                "candidates": [
+                    {
+                        "summary": c.summary(),
+                        "score": c.score,
+                        "reasons": c.reasons,
+                        "blockers": c.blockers,
+                    }
+                    for c in ranked[: args.limit]
+                ],
+            },
+        )
+
+    elif args.action == "substitute":
+        try:
+            target = float(args.args[0])
+        except (IndexError, ValueError):
+            print(Envelope(command="parts substitute", ok=False,
+                           errors=["usage: pcbkit parts substitute <ohms>"]).to_json())
+            return 1
+        combo = suggest_substitution(
+            target,
+            extended_unit_price=args.unit_price,
+            basic_unit_price=args.basic_price,
+            quantity=args.quantity,
+        )
+        envelope = Envelope(
+            command="parts substitute",
+            data={
+                "target": target,
+                "suggestion": None
+                if combo is None
+                else {
+                    "topology": combo.topology,
+                    "values": list(combo.values),
+                    "achieved": combo.achieved,
+                    "nominal_error_pct": round(combo.nominal_error_pct, 3),
+                    "worst_case_pct": round(combo.worst_case_pct, 3),
+                    "saving": combo.saving,
+                    "describe": combo.describe(),
+                    "notes": combo.notes,
+                },
+            },
+        )
+
+    else:  # resolve
+        from pcbkit.core.loader import DesignLoadError, load_design
+
+        try:
+            design = load_design(Path(args.args[0]))
+        except (IndexError, DesignLoadError) as exc:
+            print(Envelope(command="parts resolve", ok=False,
+                           errors=[str(exc) or "usage: pcbkit parts resolve <design.py>"]).to_json())
+            return 1
+        envelope = resolve_design(design, quantity=args.quantity)
+
+    print(envelope.to_json())
+    if args.strict and envelope.error_count:
+        return 1
+    return 0 if envelope.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pcbkit",
@@ -204,6 +313,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict", action="store_true", help="exit 1 if there are error findings"
     )
     profile_parser.set_defaults(func=cmd_profile)
+
+    parts_parser = sub.add_parser("parts", help="resolve, price, and source parts")
+    parts_parser.add_argument(
+        "action", choices=["index", "fetch", "pick", "resolve", "substitute"]
+    )
+    parts_parser.add_argument("args", nargs="*")
+    parts_parser.add_argument("--quantity", type=int, default=5, help="board build quantity")
+    parts_parser.add_argument("--limit", type=int, default=10)
+    parts_parser.add_argument("--unit-price", type=float, default=0.02)
+    parts_parser.add_argument("--basic-price", type=float, default=0.002)
+    parts_parser.add_argument("--strict", action="store_true")
+    parts_parser.set_defaults(func=cmd_parts)
 
     return parser
 

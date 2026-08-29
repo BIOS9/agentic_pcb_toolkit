@@ -40,7 +40,7 @@ ALLOWED_ENV_VARS = {
 # Capabilities that ship today. Each must be reachable from the CLI alone: a
 # feature living only behind a hook or skill does not exist for other agents.
 # Add to this as milestones land -- that is the point of the list.
-SHIPPED_VERBS = {"doctor", "build", "licences", "new", "profile"}
+SHIPPED_VERBS = {"doctor", "build", "licences", "new", "profile", "parts"}
 
 
 def python_sources() -> list[Path]:

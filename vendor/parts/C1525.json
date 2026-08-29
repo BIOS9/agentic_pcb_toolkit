@@ -1,0 +1,15 @@
+{
+  "assembly": true,
+  "classification": "basic",
+  "description": "100nF (104) \u00b110% 16V",
+  "fetched": "2026-08-29",
+  "lcsc": "C1525",
+  "manufacturer": "SAMSUNG(\u4e09\u661f)",
+  "min_qty": 100,
+  "mpn": "CL05B104KO5NNNC",
+  "package": "C0402",
+  "price": 0.0129,
+  "source": "easyeda",
+  "step_qty": 100,
+  "stock": 869375
+}

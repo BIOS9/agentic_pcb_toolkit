@@ -49,18 +49,34 @@ and reports it:
 
 ```
 R7 = 4.87k  (C123456, extended, +$3.00 setup, $0.02/ea)
-  alternative: 4.7k + 169R in series, both basic, $0.004/ea
-  saving at qty 5: $3.02   tolerance: 1% -> 1.4% worst case
+  alternative: 160R + 4.7k in series = 4.86k, both basic, $0.002/ea
+  saving at qty 5: $3.08
+  nominal error 0.21%, worst case 1.21% vs 1.00% for the single part
 ```
 
 **Reported, not applied.** Automatic substitution changes the schematic's
-topology to save money, and it trades tolerance, board area, and part count for
+topology to save money, and it trades accuracy, board area, and part count for
 that saving. Whether it is worth it is a design decision, so it is surfaced with
 its consequences and left to the author -- the same line CR-002 draws around
 architecture synthesis.
 
-The tolerance consequence must always be stated. Two 1% parts in series do not
-give a 1% result.
+### Correction (2026-08-29, during M4)
+
+This section originally claimed "two 1% parts in series do not give a 1% result"
+and showed a 1% -> 1.4% degradation. **That was wrong**, and the error was
+found while implementing the arithmetic.
+
+Combining equal-tolerance resistors does not multiply their tolerance. Two 1%
+parts in series, worst case both high, give `(R1 + R2) x 1.01` -- still 1%.
+Treated statistically it is better than 1%, since the deviations partly average
+out. The 1.4% figure was a root-sum-square of two independent 1% errors, which
+is not how a series total behaves.
+
+What substitution actually costs is the **nominal error**: the combination lands
+near the target, not on it. That error adds to the part tolerance, so a
+combination 0.21% off target using 1% parts is 1.21% worst case against the
+target. The accuracy consequence must still always be stated -- it is simply a
+different quantity from the one this spec first named.
 
 ## Elicitation fields
 
