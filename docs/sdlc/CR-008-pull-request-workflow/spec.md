@@ -13,10 +13,45 @@ One branch per milestone or change request, named for it: `m5-schematic-emitter`
 
 ## Required to merge
 
-1. **`checks` passes.** `nix run .#checks` — already green on the last three
-   commits, so this makes required what is already true.
-2. **`licences` passes.** CR-003 enforcement.
-3. **An independent agent review approves.**
+Two required status contexts on `main`:
+
+| Context | Set by | Means |
+|---|---|---|
+| `checks` | `.github/workflows/checks.yml` | `nix run .#checks` and `nix run .#licences` passed |
+| `agent-review` | `.github/workflows/agent-review.yml` | an independent agent posted a verdict |
+
+`checks` was already green on the last three commits, so requiring it makes
+mandatory what is already true.
+
+### How an agent review becomes an enforceable check
+
+GitHub does not permit an account to formally approve its own pull request, and
+here the author and the reviewing agent run as the same account. An agent review
+can therefore only ever be a *comment* — which this CR requires but which
+nothing could enforce.
+
+`agent-review.yml` closes that gap: a PR comment containing a `VERDICT:` line
+becomes a commit status that branch protection requires.
+
+```
+VERDICT: APPROVE                  -> success
+VERDICT: APPROVE WITH COMMENTS    -> success
+VERDICT: REQUEST CHANGES          -> failure
+```
+
+Two properties fall out of attaching the status to the **head SHA**:
+
+- **Stale approvals dismiss themselves.** A new commit is a new SHA with no
+  status, so the required check goes missing and the merge blocks until the new
+  code is reviewed. No separate dismissal rule is needed.
+- **A verdict cannot be replayed** onto code it did not review.
+
+The workflow accepts verdicts only from `OWNER`, `MEMBER`, or `COLLABORATOR`.
+That guard is load-bearing, not defensive: this repository is public, so without
+it any passer-by could approve their own pull request by commenting on it.
+
+Comments with no `VERDICT:` line are ignored rather than failed, so ordinary
+discussion does not disturb the status.
 
 ## The reviewer is a fresh agent, not a fork
 
@@ -75,10 +110,21 @@ produces the workflow and documents the rest rather than pretending.
 
 ## Repository settings
 
-On `main`: require a pull request, require the `checks` and `licences` status
-checks, require review approval, and dismiss stale approvals on new commits.
-Enabling this is an account-level change to a live repository and is left to the
-owner rather than done silently.
+On `main`: require a pull request, and require the `checks` and `agent-review`
+status contexts to be green and up to date with the base branch.
+
+Approval count is left at zero deliberately. A required *review* approval cannot
+be satisfied by an account reviewing its own pull request, so it would deadlock;
+`agent-review` is the control that actually carries the review requirement.
+
+**Ordering matters.** A workflow triggered by `issue_comment` always runs from
+the default branch, so `agent-review.yml` must be merged to `main` before it can
+gate anything. Enabling protection first would deadlock: the pull request that
+carries the workflow would require a status that only that workflow can produce.
+
+The sequence is therefore: review this pull request, merge it, then enable
+protection. That is the one merge the rule cannot cover, and it is recorded here
+rather than glossed over.
 
 ## Out of scope
 
@@ -91,6 +137,9 @@ owner rather than done silently.
 - `main` rejects a direct push.
 - A PR cannot merge with `checks` red unless a `deferred:` block names that
   check.
+- A comment carrying `VERDICT: APPROVE` sets the `agent-review` status on the
+  head SHA; pushing a further commit clears it.
+- A verdict from an account without write access is refused.
 - A review by an agent that did not author the change is recorded on the PR.
 - `pcbkit new` emits a checks workflow, and its README names the settings to
   enable.
