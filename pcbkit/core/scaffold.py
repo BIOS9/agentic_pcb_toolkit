@@ -8,11 +8,14 @@ defaults (CR-006). Both are produced here so neither depends on remembering.
 from __future__ import annotations
 
 import datetime as _dt
+import keyword
 import re
 import tomllib
 from pathlib import Path
+from typing import NamedTuple
 
 from pcbkit import __version__
+from pcbkit.core.kicad import CONFIRMED_KICAD_VERSION
 from pcbkit.core.result import Envelope, Finding, Severity
 from pcbkit.profile import DEFAULT_PROFILE, Profile, ProfileError, load
 from pcbkit.profile.dru import digest, render
@@ -35,7 +38,467 @@ build/
 fp-info-cache
 """
 
-_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+# CR-008: a board change reaches the default branch only through a reviewed
+# pull request whose checks passed. The two required status contexts.
+REQUIRED_CONTEXTS = ("gate", "agent-review")
+
+# The generated workflow needs KiCad 10 and the pcbnew module, neither of which
+# is on a hosted runner image. Pinned to the version pcbkit's format numbers
+# were confirmed against, for the reason CR-004 gives: an unpinned toolchain
+# produces output that differs between machines and nobody notices until it
+# matters.
+#
+# The `-full` variant, and that suffix is load-bearing. The plain
+# `kicad/kicad:<version>` image ships no 3D-model library at all, and
+# `env.3dmodels` is a fail-severity check -- so `pcbkit doctor --strict`, the
+# generated workflow's first step, exits 1 on a project nobody has touched.
+# Every scaffolded repository would get CI that is red before a circuit is
+# written, and a required `gate` satisfiable only by deferring a check that was
+# never broken.
+#
+# Confirmed on 2026-08-30 by running the emitted steps inside the image, not by
+# resolving its name: `10.0.5` has 0 model directories and step one exits 1;
+# `10.0.5-full` has 105 and all three steps exit 0. Resolving the tag is what
+# was checked last time, and it is not the same question -- re-run the steps,
+# not just the tag, when CONFIRMED_KICAD_VERSION moves.
+KICAD_IMAGE = f"kicad/kicad:{CONFIRMED_KICAD_VERSION}-full"
+
+# pcbkit is not on a package index yet, so a generated project fetches it from
+# source.
+#
+# The default ref is the default branch, which resolves. Pinning to
+# `v{__version__}` would be better for the reason CR-004 gives -- an unpinned
+# toolchain gives a board whose CI result can change without the board
+# changing -- but pcbkit publishes no tags yet, so that ref does not exist and
+# every generated project's first CI run would die before pcbkit was installed.
+# A gate that cannot pass is the same failure as one that cannot fail; it is
+# the reason KICAD_IMAGE was checked against the registry above.
+#
+# `pcbkit new --pcbkit-ref <tag-or-commit>` pins it, and the generated README
+# says to, so the honest default is the one that runs and the pinned one is a
+# flag away rather than a broken file away.
+PCBKIT_REPO = "https://github.com/BIOS9/agentic_pcb_toolkit"
+DEFAULT_PCBKIT_REF = "main"
+
+
+def pcbkit_source(ref: str = DEFAULT_PCBKIT_REF) -> str:
+    return f"git+{PCBKIT_REPO}@{ref}"
+
+
+def _runner(ref: str) -> str:
+    return f"uvx --from {pcbkit_source(ref)}"
+
+# CR-008's escape hatch, shared verbatim between this repository's own workflow
+# and every generated one -- `tests/test_scaffold.py` fails if the two copies
+# drift.
+#
+# A check may be knowingly red because the work is staged rather than broken:
+# the schematic gains a connector, the layout follows later, and DRC fails in
+# between. Blocking that is wrong and bypassing it quietly is worse, so the
+# deferral is declared in the pull request body and is machine-readable:
+#
+#     deferred: checks
+#     why: schematic adds the USB-C connector; layout lands in #42
+#     resolves: #42
+#
+# Three lines, because each carries information a bare override label does not:
+# which check, why, and what clears it.
+GATE_JOB = """\
+  # `checks` is deliberately *not* the required status context: a required
+  # context in GitHub is all-or-nothing, so a knowingly-red check could only be
+  # got past by an admin bypass -- the quiet override CR-008 rejects. `gate` is
+  # required instead, and it passes either because `checks` is green or because
+  # the pull request body declares the failure, says why, and names what
+  # resolves it.
+  gate:
+    needs: [checks]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a green check, or a declared deferral
+        env:
+          RESULT: ${{ needs.checks.result }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -uo pipefail
+
+          if [ "$RESULT" = "success" ]; then
+            echo "checks passed"
+            exit 0
+          fi
+
+          verdict=$(printf '%s\\n' "$BODY" | tr -d '\\r' | awk -v want=checks '
+            # A declaration is prose at column 0, not an example. Fenced blocks and HTML
+            # comments both put text at column 0, and this syntax appears inside both in
+            # the documentation that teaches it -- so a pull request quoting its own
+            # README would otherwise defer its own checks, and one hiding the block in a
+            # comment would defer them with nothing visible on the page.
+            #
+            # Both exclusions are decided within the line rather than by a rule per line,
+            # because a line that does two things at once defeated both of the earlier
+            # per-line versions. What is left after this block is what a reader sees.
+            #
+            # An HTML comment is not the only thing that renders as nothing: CommonMark
+            # has four raw-HTML openers GitHub drops entirely, each with its own
+            # terminator, and a declaration under any of them is invisible on the page.
+            # Longest first, so `<![CDATA[` is not read as a bare `<!`.
+            BEGIN {
+              n_html = 4
+              open_tok[1] = "<![CDATA["; close_for[1] = "]]>"
+              open_tok[2] = "<!--";      close_for[2] = "-->"
+              open_tok[3] = "<!";        close_for[3] = ">"
+              open_tok[4] = "<?";        close_for[4] = "?>"
+            }
+
+            # `<!` opens a raw-HTML block only when a letter follows it, so `<!-->` and
+            # a stray `<!` in prose are text. Without the check the gate would hide a
+            # declaration a reader can plainly see.
+            function find_open(s, tok,   at, base, hit) {
+              base = 0
+              while (1) {
+                hit = index(substr(s, base + 1), tok)
+                if (hit == 0) return 0
+                at = base + hit
+                if (tok != "<!" || substr(s, at + 2, 1) ~ /^[A-Za-z]$/) return at
+                base = at
+              }
+            }
+
+            {
+              # A fence closes only on a line carrying the delimiter and nothing else.
+              # CommonMark allows an info string on the *opening* fence only, so a
+              # ```js line inside a ``` block is content -- closing on it read the rest
+              # of a quoted document as live declarations. Delimiter and run length are
+              # compared too, because quoting a document that itself contains a fence
+              # needs a longer outer fence and the inner one must not close it.
+              #
+              # At most three spaces of indent, on both the open and the close: four is
+              # an indented code block, so ` ? ? ?` is what separates a fence from a
+              # line that only looks like one. Written out rather than as an interval
+              # expression, which mawk -- the awk on a hosted runner -- does not have.
+              if (fence) {
+                if (match($0, /^ ? ? ?(```+|~~~+)[[:space:]]*$/)) {
+                  run = $0; sub(/^ ? ? ?/, "", run); sub(/[[:space:]]*$/, "", run)
+                  if (substr(run, 1, 1) == fence_ch && length(run) >= fence_len) fence = 0
+                }
+                next
+              }
+              if (!hidden && match($0, /^ ? ? ?(```+|~~~+)/)) {
+                run = substr($0, RSTART, RLENGTH); sub(/^ ? ? ?/, "", run)
+                fence = 1; fence_ch = substr(run, 1, 1); fence_len = length(run)
+                next
+              }
+
+              # Raw HTML is scanned in order across the line. Two line-level rules
+              # cannot see that `--> <!--` closes one span and opens another, and a
+              # body that rendered to nothing at all was read as a live declaration.
+              rest = $0; visible = ""
+              while (length(rest) > 0) {
+                if (hidden) {
+                  at = index(rest, close_tok)
+                  if (at == 0) { rest = ""; break }
+                  rest = substr(rest, at + length(close_tok)); hidden = 0
+                  continue
+                }
+                first = 0
+                for (i = 1; i <= n_html; i++) {
+                  at = find_open(rest, open_tok[i])
+                  if (at > 0 && (first == 0 || at < first)) { first = at; which = i }
+                }
+                if (first == 0) { visible = visible rest; rest = ""; break }
+                visible = visible substr(rest, 1, first - 1)
+                rest = substr(rest, first + length(open_tok[which]))
+                close_tok = close_for[which]; hidden = 1
+              }
+              $0 = visible
+            }
+
+            function judge() {
+              if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) return "declared"
+              if (name == want) return "malformed"
+              return ""
+            }
+
+            # Evaluated when a block ends rather than on a fixed field order, so
+            # `resolves:` before `why:` is the same declaration, and a block immediately
+            # followed by another is not lost.
+            /^deferred:/ {
+              if ((verdict = judge()) != "") exit
+              sub(/^deferred:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, "")
+              name = $0; why = ""; res = ""; next
+            }
+            /^why:/ {
+              if (name != "") { sub(/^why:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); why = $0 }
+              next
+            }
+            /^resolves:/ {
+              if (name != "") { sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0 }
+              next
+            }
+            END { if (verdict == "") verdict = judge(); if (verdict != "") print verdict }
+          ')
+
+          case "$verdict" in
+            declared)
+              echo "::warning::checks is '$RESULT' and deferred by declaration in the pull request body"
+              echo "Tracked debt, not a pass. An unresolved deferral is a finding at the fab gate."
+              exit 0 ;;
+            malformed)
+              echo "::error::the deferral for 'checks' is incomplete"
+              echo "::error::it needs all three lines: 'deferred: checks', a non-empty 'why:', and 'resolves: #<issue>'"
+              echo "::error::order does not matter; a block inside a code fence or raw HTML does not count"
+              exit 1 ;;
+            *)
+              echo "::error::checks is '$RESULT' and no deferral declares it"
+              echo "::error::fix the check, or declare the deferral in the pull request body:"
+              echo "::error::  deferred: checks"
+              echo "::error::  why: <what is staged, and why this is not broken>"
+              echo "::error::  resolves: #<issue that clears it>"
+              echo "::error::at the start of a line, not inside a code fence or raw HTML"
+              echo "::error::an unclosed fence, or an unclosed '<!--', '<?', '<![CDATA[' or"
+              echo "::error::'<!DOCTYPE' earlier in the body, hides everything after it"
+              exit 1 ;;
+          esac
+"""
+
+# Every command the generated workflow runs, as data rather than as a YAML
+# blob, so a test can assert each one is a verb the CLI actually has. The
+# defect CR-008 was raised over was a CI step that could not fail; a step that
+# cannot even run is the same failure one stage earlier.
+#
+# `{design}` expands to the starter design file. `gates` says whether the step
+# can fail on a bad board, as opposed to only on a broken tool -- recorded per
+# step rather than inferred from the command, because inferring it is how a
+# test comes to assert its own comment.
+class Step(NamedTuple):
+    label: str
+    command: str
+    gates: bool
+
+
+CHECK_STEPS: tuple[Step, ...] = (
+    # Setup, not a gate: it fails only if the toolchain itself is broken.
+    Step("Toolchain", "pcbkit doctor --strict", gates=False),
+    # Also setup. The rules file is generated and gitignored (CR-005), so CI
+    # makes its own from the committed profile rather than trusting one in the
+    # tree. It exits 0 for any well-formed project.
+    Step("Design rules from the profile", "pcbkit profile regenerate .", gates=False),
+    # The gate. `--strict` turns error-severity findings into a nonzero exit,
+    # so a design with an unconnected part, a duplicate refdes, or a dangling
+    # reference fails CI. It is the structural layer only: ERC, profile DRC,
+    # and the electrical rules join it as `pcbkit check --strict` at M7, and
+    # naming that verb before it exists would emit a workflow that cannot run.
+    Step("Build", "pcbkit build {design} --strict", gates=True),
+)
+
+
+def _workflow(name: str, ref: str) -> str:
+    """The checks workflow for a generated project.
+
+    Deliberately not a copy of this repository's own workflow, which runs
+    through a Nix flake a board project does not have. Two things it must get
+    right or it emits a gate that cannot pass:
+
+    * KiCad 10 and its `pcbnew` module are not on the hosted runner image, so
+      the job runs inside the fabricator-independent KiCad container.
+    * pcbkit is not published, so it is fetched from source. The default ref is
+      the default branch and is therefore *not* a pin -- pcbkit has no tags to
+      pin to. `--pcbkit-ref` takes one, and the README states which it got.
+    """
+    steps = "\n".join(
+        f"      - name: {step.label}\n        run: {_runner(ref)} {step.command.format(design=f'src/{name}.py')}"
+        for step in CHECK_STEPS
+    )
+    return f"""\
+name: checks
+
+# Generated by `pcbkit new`. Every verb exits 0 with findings and nonzero only
+# when a tool failed, so --strict is what turns a check into a gate.
+#
+# The container carries KiCad and pcbnew; uvx supplies pcbkit itself. Bump the
+# tag when you upgrade KiCad, and re-run the build before trusting the output:
+# a format-version change is a real difference, not noise.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `edited` matters: a deferral is declared in the pull request body, so
+    # editing the body must re-evaluate the gate.
+    types: [opened, synchronize, reopened, edited]
+
+# `gate` reads the pull request body as it was when the event fired, so two
+# edits in quick succession race and the run that finishes last wins.
+# Superseding the older run makes the newest body the one that decides.
+concurrency:
+  group: checks-${{{{ github.event.pull_request.number || github.ref }}}}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    container:
+      image: {KICAD_IMAGE}
+      # The image's default user is `kicad` (uid 1000); a hosted runner owns the
+      # mounted workspace as uid 1001, so checkout cannot write it. A container
+      # job that cannot check out is a gate that cannot pass.
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+{steps}
+
+{GATE_JOB}"""
+
+
+def _wrap(text: str) -> str:
+    """Hard-wrap to match the rest of the generated README."""
+    import textwrap
+
+    return "\n".join(textwrap.wrap(text, width=79))
+
+
+def _readme(name: str, profile: Profile, process_id: str, ref: str) -> str:
+    """What the project is, how to check it, and what to enable by hand.
+
+    pcbkit cannot configure another account's repository, so the settings are
+    stated rather than pretended (CR-008).
+    """
+    commands = "\n".join(
+        f"$ {step.command.format(design=f'src/{name}.py')}" for step in CHECK_STEPS
+    )
+    contexts = "\n".join(f"   - `{context}`" for context in REQUIRED_CONTEXTS)
+
+    # A 40-character hash or a version tag is a pin; anything else is a moving
+    # ref, and the difference is the whole of CR-004 for this project. Deliberately
+    # narrow: `v?[0-9].*` called a branch named `2026-refactor` a pin, and telling
+    # someone their CI is reproducible when it is not is the wrong error to make.
+    pinned = bool(re.fullmatch(r"[0-9a-fA-F]{40}|v?[0-9]+(\.[0-9]+)*", ref))
+    if pinned:
+        ref_note = _wrap(
+            f"pcbkit itself is pinned at `{ref}`, so this project's CI result "
+            "changes only when the project does."
+        )
+    else:
+        ref_note = (
+            _wrap(
+                f"pcbkit itself is fetched from `{ref}`, which is a moving "
+                "ref: this project's CI result can change without the project "
+                "changing, because a pcbkit release alters the output and "
+                "nothing here records that it did. Pin it to a tag or a commit "
+                "once you have one you trust, either with"
+            )
+            + "\n\n```console\n$ pcbkit new <project> --pcbkit-ref <tag-or-commit>\n```\n\n"
+            + _wrap("or by editing the `uvx --from` ref in the workflow directly.")
+        )
+    return f"""\
+# {name}
+
+A pcbkit board project. The circuit is Python under `src/`; everything KiCad
+reads is generated from it.
+
+```console
+{commands}
+```
+
+## What is committed, and what is not
+
+`pcbkit.toml`, `profiles/{profile.vendor.lower()}.yaml`, and `src/` are the
+project. Gerbers, renders, findings, and `{name}.kicad_dru` are generated from
+those, and `.gitignore` excludes them — regenerate them, never commit them.
+
+The fabricator profile is *copied* into this project rather than referenced by
+name, so a board revised in two years regenerates the same design rules.
+
+Fabricator: {profile.vendor}, process `{process_id}`.
+
+## Before you order
+
+`pcbkit doctor --strict` reports whether the toolchain is pinned. An unpinned
+build works; it is just not guaranteed to match another machine.
+
+## Continuous integration
+
+`.github/workflows/checks.yml` runs the same commands on every pull request,
+inside `{KICAD_IMAGE}` because KiCad 10 and its `pcbnew` module are not on a
+hosted runner image.
+
+{ref_note}
+
+Whatever you choose, it must be a ref that resolves: a workflow whose first step
+cannot install pcbkit is a gate that can never pass, and `gate` is the context
+you are about to require.
+
+## Branch protection
+
+The workflow only reports — it does not block. Enabling that is an
+account-level change pcbkit cannot make for you.
+
+Requiring a context that nothing produces blocks every merge, so read this
+before you select any: `gate` is produced by the generated workflow, and
+`agent-review` is produced **only if you add a review workflow of your own**.
+If you are not running one, leave `agent-review` out of step 3.
+
+Require `gate` rather than `checks` — see the next section for why.
+
+On `main`, in Settings → Branches → Add branch protection rule:
+
+1. Require a pull request before merging.
+2. Require status checks to pass, and require branches to be up to date.
+3. Select these contexts:
+{contexts}
+
+## Deferring a check, without bypassing it
+
+A check is sometimes knowingly red because the work is staged, not broken: the
+schematic gains a connector and the layout follows in a later change, so DRC
+fails in between. Blocking that is wrong; bypassing it quietly is worse.
+
+A required status context is all-or-nothing, so `gate` is the required one and
+`checks` is not. `gate` passes when `checks` is green, or when the pull request
+body declares the failure:
+
+```
+deferred: checks
+why: schematic adds the USB-C connector; layout lands in #42
+resolves: #42
+```
+
+Three lines, because each carries something a bare override label does not:
+which check, why, and what clears it. All three are required — an incomplete
+declaration fails the gate rather than passing it. Their order does not matter.
+
+Each must start at the beginning of a line, and **a block inside a code fence,
+an HTML comment, or any other raw HTML that renders as nothing does not
+count**. Otherwise a pull request that quoted this README would defer its own
+checks, and one that hid the block in a comment would defer them with nothing
+visible on the page — which is the quiet override the three lines exist to
+prevent. The rule is what a reader sees on the pull request page.
+
+A deferral is tracked debt, not a pass. It stays visible in the pull request
+list, and a board that reaches an order with one unresolved is a board whose
+checks nobody finished.
+
+An unreviewed board change becomes an unreviewed order, which is the point at
+which a mistake starts costing money.
+"""
+
+
+# Matched with `fullmatch`, never `match`: in Python `$` also matches just
+# before a trailing newline, so an anchored `match` accepts `demo\n` -- which
+# reaches a `run:` line and a TOML key and breaks both.
+_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
+
+# The ref is interpolated into a `run:` line of the generated workflow, so it
+# has to be a ref and not a command. A conservative subset of what git accepts:
+# anything outside it either is not a valid ref anyway or would turn a workflow
+# step into something its reader did not write.
+_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def valid_ref(ref: str) -> bool:
+    return bool(_REF_RE.fullmatch(ref)) and ".." not in ref and not ref.endswith(".lock")
 
 
 def _starter_design(name: str) -> str:
@@ -92,17 +555,41 @@ def new_project(
     profile_name: str = DEFAULT_PROFILE,
     layers: int = 2,
     process_id: str | None = None,
+    pcbkit_ref: str = DEFAULT_PCBKIT_REF,
 ) -> Envelope:
     directory = Path(directory)
     name = name or directory.name
 
-    if not _NAME_RE.match(name):
+    if not _NAME_RE.fullmatch(name):
         return Envelope(
             command="new",
             ok=False,
             errors=[
                 f"invalid project name {name!r}: must start with a letter and "
                 "contain only letters, digits, hyphens, and underscores"
+            ],
+        )
+    # The name becomes `def {name}():` in the starter design, so a keyword
+    # scaffolds a project whose first build is a SyntaxError -- a gate that
+    # cannot pass, handed to the user at `pcbkit new` rather than in CI.
+    if keyword.iskeyword(name.replace("-", "_")):
+        return Envelope(
+            command="new",
+            ok=False,
+            errors=[
+                f"invalid project name {name!r}: it is a Python keyword, and "
+                "the name becomes a function in the starter design"
+            ],
+        )
+    if not valid_ref(pcbkit_ref):
+        return Envelope(
+            command="new",
+            ok=False,
+            errors=[
+                f"invalid pcbkit ref {pcbkit_ref!r}: must be a git ref -- "
+                "letters, digits, and '._/-' only. It is written into a "
+                "workflow step, so anything else would put text there that "
+                "nobody wrote as a command."
             ],
         )
     if directory.exists() and any(directory.iterdir()):
@@ -127,6 +614,13 @@ def new_project(
 
     (directory / PROJECT_FILE).write_text(_project_toml(name, profile, process.id))
     (directory / ".gitignore").write_text(GITIGNORE)
+    (directory / "README.md").write_text(_readme(name, profile, process.id, pcbkit_ref))
+
+    # CR-008: the workflow ships with the project, the branch protection it
+    # feeds is documented in the README because pcbkit cannot enable it.
+    workflows = directory / ".github" / "workflows"
+    workflows.mkdir(parents=True, exist_ok=True)
+    (workflows / "checks.yml").write_text(_workflow(name, pcbkit_ref))
 
     dru_text = render(profile, process)
     dru_path = directory / f"{name}.kicad_dru"

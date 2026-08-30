@@ -4,6 +4,19 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `edited` matters: a deferral is declared in the pull request body, so
+    # editing the body must re-evaluate the gate. Without it a declaration
+    # added after the first run would never be seen.
+    types: [opened, synchronize, reopened, edited]
+
+# `gate` reads the pull request body as it was when the event fired, so two
+# edits in quick succession start two runs whose bodies differ and the one that
+# finishes last wins. Superseding the older run makes the newest body the one
+# that decides -- otherwise a deferral could be added, edited straight back out,
+# and the green from the first run survive.
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   checks:
@@ -18,3 +31,159 @@ jobs:
       # in YAML instead of the flake is a second source of truth and will drift.
       - run: nix run .#checks
       - run: nix run .#licences
+
+  # `checks` is deliberately *not* the required status context: a required
+  # context in GitHub is all-or-nothing, so a knowingly-red check could only be
+  # got past by an admin bypass -- the quiet override CR-008 rejects. `gate` is
+  # required instead, and it passes either because `checks` is green or because
+  # the pull request body declares the failure, says why, and names what
+  # resolves it.
+  gate:
+    needs: [checks]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a green check, or a declared deferral
+        env:
+          RESULT: ${{ needs.checks.result }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -uo pipefail
+
+          if [ "$RESULT" = "success" ]; then
+            echo "checks passed"
+            exit 0
+          fi
+
+          verdict=$(printf '%s\n' "$BODY" | tr -d '\r' | awk -v want=checks '
+            # A declaration is prose at column 0, not an example. Fenced blocks and HTML
+            # comments both put text at column 0, and this syntax appears inside both in
+            # the documentation that teaches it -- so a pull request quoting its own
+            # README would otherwise defer its own checks, and one hiding the block in a
+            # comment would defer them with nothing visible on the page.
+            #
+            # Both exclusions are decided within the line rather than by a rule per line,
+            # because a line that does two things at once defeated both of the earlier
+            # per-line versions. What is left after this block is what a reader sees.
+            #
+            # An HTML comment is not the only thing that renders as nothing: CommonMark
+            # has four raw-HTML openers GitHub drops entirely, each with its own
+            # terminator, and a declaration under any of them is invisible on the page.
+            # Longest first, so `<![CDATA[` is not read as a bare `<!`.
+            BEGIN {
+              n_html = 4
+              open_tok[1] = "<![CDATA["; close_for[1] = "]]>"
+              open_tok[2] = "<!--";      close_for[2] = "-->"
+              open_tok[3] = "<!";        close_for[3] = ">"
+              open_tok[4] = "<?";        close_for[4] = "?>"
+            }
+
+            # `<!` opens a raw-HTML block only when a letter follows it, so `<!-->` and
+            # a stray `<!` in prose are text. Without the check the gate would hide a
+            # declaration a reader can plainly see.
+            function find_open(s, tok,   at, base, hit) {
+              base = 0
+              while (1) {
+                hit = index(substr(s, base + 1), tok)
+                if (hit == 0) return 0
+                at = base + hit
+                if (tok != "<!" || substr(s, at + 2, 1) ~ /^[A-Za-z]$/) return at
+                base = at
+              }
+            }
+
+            {
+              # A fence closes only on a line carrying the delimiter and nothing else.
+              # CommonMark allows an info string on the *opening* fence only, so a
+              # ```js line inside a ``` block is content -- closing on it read the rest
+              # of a quoted document as live declarations. Delimiter and run length are
+              # compared too, because quoting a document that itself contains a fence
+              # needs a longer outer fence and the inner one must not close it.
+              #
+              # At most three spaces of indent, on both the open and the close: four is
+              # an indented code block, so ` ? ? ?` is what separates a fence from a
+              # line that only looks like one. Written out rather than as an interval
+              # expression, which mawk -- the awk on a hosted runner -- does not have.
+              if (fence) {
+                if (match($0, /^ ? ? ?(```+|~~~+)[[:space:]]*$/)) {
+                  run = $0; sub(/^ ? ? ?/, "", run); sub(/[[:space:]]*$/, "", run)
+                  if (substr(run, 1, 1) == fence_ch && length(run) >= fence_len) fence = 0
+                }
+                next
+              }
+              if (!hidden && match($0, /^ ? ? ?(```+|~~~+)/)) {
+                run = substr($0, RSTART, RLENGTH); sub(/^ ? ? ?/, "", run)
+                fence = 1; fence_ch = substr(run, 1, 1); fence_len = length(run)
+                next
+              }
+
+              # Raw HTML is scanned in order across the line. Two line-level rules
+              # cannot see that `--> <!--` closes one span and opens another, and a
+              # body that rendered to nothing at all was read as a live declaration.
+              rest = $0; visible = ""
+              while (length(rest) > 0) {
+                if (hidden) {
+                  at = index(rest, close_tok)
+                  if (at == 0) { rest = ""; break }
+                  rest = substr(rest, at + length(close_tok)); hidden = 0
+                  continue
+                }
+                first = 0
+                for (i = 1; i <= n_html; i++) {
+                  at = find_open(rest, open_tok[i])
+                  if (at > 0 && (first == 0 || at < first)) { first = at; which = i }
+                }
+                if (first == 0) { visible = visible rest; rest = ""; break }
+                visible = visible substr(rest, 1, first - 1)
+                rest = substr(rest, first + length(open_tok[which]))
+                close_tok = close_for[which]; hidden = 1
+              }
+              $0 = visible
+            }
+
+            function judge() {
+              if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) return "declared"
+              if (name == want) return "malformed"
+              return ""
+            }
+
+            # Evaluated when a block ends rather than on a fixed field order, so
+            # `resolves:` before `why:` is the same declaration, and a block immediately
+            # followed by another is not lost.
+            /^deferred:/ {
+              if ((verdict = judge()) != "") exit
+              sub(/^deferred:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, "")
+              name = $0; why = ""; res = ""; next
+            }
+            /^why:/ {
+              if (name != "") { sub(/^why:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); why = $0 }
+              next
+            }
+            /^resolves:/ {
+              if (name != "") { sub(/^resolves:[[:space:]]*/, ""); gsub(/[[:space:]]+$/, ""); res = $0 }
+              next
+            }
+            END { if (verdict == "") verdict = judge(); if (verdict != "") print verdict }
+          ')
+
+          case "$verdict" in
+            declared)
+              echo "::warning::checks is '$RESULT' and deferred by declaration in the pull request body"
+              echo "Tracked debt, not a pass. An unresolved deferral is a finding at the fab gate."
+              exit 0 ;;
+            malformed)
+              echo "::error::the deferral for 'checks' is incomplete"
+              echo "::error::it needs all three lines: 'deferred: checks', a non-empty 'why:', and 'resolves: #<issue>'"
+              echo "::error::order does not matter; a block inside a code fence or raw HTML does not count"
+              exit 1 ;;
+            *)
+              echo "::error::checks is '$RESULT' and no deferral declares it"
+              echo "::error::fix the check, or declare the deferral in the pull request body:"
+              echo "::error::  deferred: checks"
+              echo "::error::  why: <what is staged, and why this is not broken>"
+              echo "::error::  resolves: #<issue that clears it>"
+              echo "::error::at the start of a line, not inside a code fence or raw HTML"
+              echo "::error::an unclosed fence, or an unclosed '<!--', '<?', '<![CDATA[' or"
+              echo "::error::'<!DOCTYPE' earlier in the body, hides everything after it"
+              exit 1 ;;
+          esac

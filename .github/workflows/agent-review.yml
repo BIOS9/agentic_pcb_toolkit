@@ -1,0 +1,195 @@
+name: agent-review
+
+# CR-008 requires an independent agent review before merge. GitHub will not let
+# an account formally approve its own pull request, so the review lands as a
+# comment and this workflow converts it into a commit status that branch
+# protection can require.
+#
+# The verdict names the commit it reviewed and this workflow refuses to record
+# it anywhere else. Resolving the head SHA at run time is not enough: a fork PR
+# can be force-pushed between the reviewer reading the diff and the comment
+# landing, which would stamp a verdict onto code nobody read.
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+
+# Two verdicts posted seconds apart must not race: a commit status is
+# last-write-wins per context, so out-of-order delivery decides the outcome.
+concurrency:
+  group: agent-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  record-verdict:
+    # Only PR comments that carry a verdict line. Everything else is ignored
+    # rather than failing, so ordinary discussion does not touch the status.
+    #
+    # The association test is here rather than in a step so a passer-by on this
+    # public repository cannot start a runner by commenting the trigger string.
+    # It is a cheap filter, not the authorisation check -- author_association
+    # says nothing about repository permission, so the real check runs below.
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, 'VERDICT:') &&
+      contains(github.event.comment.body, 'reviewed:') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require write access to this repository
+        id: guard
+        # COLLABORATOR covers read-only and triage invitations, and MEMBER is
+        # org membership; neither implies the ability to push. This repository
+        # is public, so the difference is the whole control: without it an
+        # account trusted only to read could turn its own pull request green.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          set -uo pipefail
+          # stderr is kept: this is the one step the spec says to smoke-test,
+          # and discarding the difference between "endpoint unreadable" and
+          # "not a collaborator at all" would discard the evidence that makes
+          # the test worth running.
+          if permission=$(gh api \
+              "repos/${{ github.repository }}/collaborators/$ACTOR/permission" \
+              --jq .permission 2>err.log); then
+            case "$permission" in
+              admin|write|maintain)
+                echo "verdict accepted from $ACTOR ($permission)"
+                exit 0 ;;
+              *)
+                echo "::error::verdict from '$ACTOR' ignored; has '$permission', needs write"
+                exit 1 ;;
+            esac
+          fi
+
+          echo "::warning::could not read collaborator permission:"
+          sed 's/^/  /' err.log || true
+
+          # The endpoint can be unavailable to GITHUB_TOKEN depending on how
+          # the repository is configured. Failing closed here would deadlock
+          # `main` permanently and invisibly, because an issue_comment run does
+          # not appear in the pull request's checks list. Falling back to OWNER
+          # keeps the mechanism working without ever accepting a weaker claim:
+          # OWNER is the account that owns the repository, unlike COLLABORATOR
+          # which covers read-only invitations.
+          if [ "$ASSOCIATION" = "OWNER" ]; then
+            echo "::warning::could not read collaborator permission; accepting OWNER $ACTOR"
+            exit 0
+          fi
+          echo "::error::could not read collaborator permission for '$ACTOR', and they are not OWNER"
+          exit 1
+
+      - name: Resolve the head commit
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" --jq .head.sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "head is $sha"
+
+      - name: Parse the verdict
+        id: verdict
+        env:
+          BODY: ${{ github.event.comment.body }}
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          set -uo pipefail
+          # GitHub delivers comment bodies with CRLF line endings.
+          body=$(printf '%s' "$BODY" | tr -d '\r')
+
+          # Which commit does this verdict claim to be about? Answered before
+          # anything else, because a verdict about some other commit must not
+          # touch this one's status -- not even to report its own failure.
+          #
+          # The full 40 characters, compared for equality. An abbreviated
+          # prefix is not enough: seven hex characters is 2^28, and grinding a
+          # commit to a chosen short prefix is minutes of off-the-shelf work.
+          # That would reopen the exact replay this binding exists to close --
+          # prepare a benign A and a malicious B sharing a prefix, get A
+          # reviewed, then force-push B before the comment lands.
+          reviewed=$(printf '%s\n' "$body" \
+            | grep -oiE '^reviewed:[[:space:]]*[0-9a-f]{40}([[:space:]]|$)' \
+            | tail -1 | grep -oiE '[0-9a-f]{40}' | tr 'A-F' 'a-f')
+          head_sha=$(printf '%s' "$HEAD_SHA" | tr 'A-F' 'a-f')
+
+          if [ -z "$reviewed" ]; then
+            echo "::error::verdict has no 'reviewed: <sha>' line naming the commit it reviewed"
+            echo "::error::it must be the full 40-character commit hash"
+            exit 1
+          fi
+          if [ "$reviewed" != "$head_sha" ]; then
+            echo "::error::verdict reviewed $reviewed, but head is $head_sha"
+            echo "::error::the branch moved; review the new commit"
+            exit 1
+          fi
+
+          # From here the comment is definitely about the current head, so a
+          # failure below is worth recording against it.
+          echo "targeted=1" >> "$GITHUB_OUTPUT"
+
+          # Anchored to the start of a line, and it must be the last non-empty
+          # line of the comment. An unanchored search lets a postscript after
+          # the real verdict win -- "(earlier I wrote VERDICT: APPROVE)" would
+          # flip a request for changes to success.
+          # Trailing whitespace is invisible in the editor that produced it,
+          # and this comparison is byte-exact. Without the trim, a stray space
+          # after a good verdict takes the error path -- and since the comment
+          # already named the head, that clears the author's own approval.
+          last=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | tail -1 \
+            | sed 's/[[:space:]]*$//')
+          case "$last" in
+            "VERDICT: APPROVE") state=success; desc="Agent review approved" ;;
+            "VERDICT: APPROVE WITH COMMENTS") state=success; desc="Agent review approved with comments" ;;
+            "VERDICT: REQUEST CHANGES") state=failure; desc="Agent review requested changes" ;;
+            *)
+              echo "::error::the last line of the comment must be exactly one of:"
+              echo "::error::  VERDICT: APPROVE / VERDICT: APPROVE WITH COMMENTS / VERDICT: REQUEST CHANGES"
+              echo "::error::got: $last"
+              exit 1 ;;
+          esac
+
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "desc=$desc" >> "$GITHUB_OUTPUT"
+
+      - name: Record the commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.sha }}" \
+            -f state='${{ steps.verdict.outputs.state }}' \
+            -f context='agent-review' \
+            -f description='${{ steps.verdict.outputs.desc }}' \
+            -f target_url='${{ github.event.comment.html_url }}'
+
+      - name: Report a failure that would otherwise be invisible
+        # An issue_comment run does not appear in the pull request's checks
+        # list, so without this a malformed verdict fails silently and an
+        # earlier success keeps standing.
+        #
+        # Only for a comment that named the current head. A verdict about an
+        # older commit, or a comment that merely mentions the syntax, must not
+        # be able to clear a legitimate status on code it was not about.
+        if: >-
+          failure() && steps.guard.outcome == 'success' &&
+          steps.pr.outputs.sha != '' && steps.verdict.outputs.targeted == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.sha }}" \
+            -f state='error' \
+            -f context='agent-review' \
+            -f description='Verdict could not be recorded; see the run log' \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

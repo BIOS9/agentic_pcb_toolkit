@@ -14,6 +14,7 @@ from pcbkit.core.build import build
 from pcbkit.core.env import Status, doctor
 from pcbkit.core.licences import audit
 from pcbkit.core.scaffold import (
+    DEFAULT_PCBKIT_REF,
     check_design_rules,
     new_project,
     regenerate_design_rules,
@@ -90,6 +91,7 @@ def cmd_new(args: argparse.Namespace) -> int:
         profile_name=args.profile,
         layers=args.layers,
         process_id=args.process,
+        pcbkit_ref=args.pcbkit_ref,
     )
     print(envelope.to_json())
     return 0 if envelope.ok else 1
@@ -295,6 +297,15 @@ def build_parser() -> argparse.ArgumentParser:
     new_parser.add_argument("--profile", default=DEFAULT_PROFILE)
     new_parser.add_argument("--layers", type=int, default=2)
     new_parser.add_argument("--process", help="select a process by id instead of layer count")
+    new_parser.add_argument(
+        "--pcbkit-ref",
+        default=DEFAULT_PCBKIT_REF,
+        help=(
+            "git ref the generated CI installs pcbkit from (default: "
+            f"{DEFAULT_PCBKIT_REF}). Pin it to a tag or commit for a "
+            "reproducible board CI."
+        ),
+    )
     new_parser.set_defaults(func=cmd_new)
 
     profile_parser = sub.add_parser(

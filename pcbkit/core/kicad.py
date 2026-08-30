@@ -17,6 +17,12 @@ from pathlib import Path
 
 from pcbkit.core import toolchain
 
+# The KiCad the format versions below were confirmed against. Anything that
+# names a KiCad version -- a container tag in a generated workflow, a doctor
+# message -- derives it from here, so upgrading KiCad is one edit and the
+# emitter tests that must be re-run are the ones that fail.
+CONFIRMED_KICAD_VERSION = "10.0.5"
+
 # File format versions emitted by KiCad 10.0.5, confirmed empirically on the
 # target machine (see docs/sdlc/M0/spec.md). Emitters target these exactly; the
 # doctor check warns when the installed KiCad drifts away from them.

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
+from pcbkit import __version__
 from pcbkit.cli import main
-from pcbkit.core import kicad
+from pcbkit.core import kicad, scaffold
 from pcbkit.core.scaffold import (
     check_design_rules,
     new_project,
@@ -24,7 +27,9 @@ def test_new_project_layout(tmp_path):
     assert envelope.ok
     created = set(envelope.data["created"])
     assert created == {
+        ".github/workflows/checks.yml",
         ".gitignore",
+        "README.md",
         "demo.kicad_dru",
         "pcbkit.toml",
         "profiles/jlcpcb.yaml",
@@ -179,3 +184,481 @@ pcbnew.SaveBoard({str(board)!r}, b)
     # KiCad names our rule, which proves the rules file is the source.
     assert "Track width, outer layer" in widths[0]["description"]
     assert f"{limit:.4f}" in widths[0]["description"]
+
+
+# CR-008: a board change reaches main only through a reviewed pull request whose
+# checks passed. pcbkit cannot enable branch protection on someone else's
+# account, so it emits the workflow and documents the settings.
+
+
+def test_generated_ci_runs_only_verbs_the_cli_actually_has():
+    """The defect CR-008 was raised over was a CI step that could not fail. A
+    step naming a verb that does not exist is the same failure one stage
+    earlier, and it would be discovered by a user, in their CI, not here."""
+    import shlex
+
+    from pcbkit.cli import build_parser
+
+    parser = build_parser()
+    for step in scaffold.CHECK_STEPS:
+        argv = shlex.split(step.command.format(design="src/demo.py"))
+        assert argv[0] == "pcbkit", f"{step.label}: not a pcbkit invocation"
+        try:
+            parser.parse_args(argv[1:])
+        except SystemExit as exc:  # argparse exits rather than raising
+            pytest.fail(f"{step.label}: `{step.command}` is not valid pcbkit ({exc})")
+
+
+def test_at_least_one_ci_step_can_fail_on_a_bad_board():
+    """A workflow of setup steps is a report, not a gate. `--strict` is what
+    turns pcbkit's findings-are-data contract into one (AGENTS.md rule 3), so
+    every step claiming to gate must carry it -- and something must claim to."""
+    gating = [step for step in scaffold.CHECK_STEPS if step.gates]
+    assert gating, "no step in the generated workflow can fail on a bad board"
+    for step in gating:
+        assert "--strict" in step.command, f"{step.label}: gates without --strict"
+
+
+def test_the_gating_step_actually_fails_a_broken_project(tmp_path):
+    """Run it, rather than asserting the comment that says it gates.
+
+    The defect CR-008 was raised over was a CI step that could not fail, and
+    the way that survived was a check nobody executed. So this executes the
+    generated workflow's gating command against a project broken in a way the
+    build layer can see, and against the untouched scaffold.
+    """
+    import shlex
+    import subprocess
+    import sys
+
+    project = tmp_path / "demo"
+    new_project(project)
+    gating = [step for step in scaffold.CHECK_STEPS if step.gates]
+    argv = shlex.split(gating[0].command.format(design="src/demo.py"))
+
+    def run() -> tuple[int, str]:
+        result = subprocess.run(
+            [sys.executable, "-m", "pcbkit.cli", *argv[1:]],
+            cwd=project,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+    assert run()[0] == 0, "the scaffold as generated must pass its own gate"
+
+    design = project / "src" / "demo.py"
+    design.write_text(
+        design.read_text().replace(
+            "    rule.decouple(led, max_mm=5)",
+            "    orphan = R('10k', pkg='0603')   # connected to nothing",
+        )
+    )
+    code, out = run()
+    assert code == 1, "an unconnected part must fail the gate"
+    # The exit code alone would also be satisfied by a SyntaxError, which would
+    # make this pass while testing nothing about the gate.
+    assert "unconnected" in out, f"failed for the wrong reason: {out}"
+
+
+def test_every_generated_step_runs_against_the_scaffold(tmp_path):
+    """Not only the gating one.
+
+    `pcbkit doctor --strict` and `pcbkit profile regenerate .` were executed by
+    no test at all, and a first step that cannot pass is a gate that cannot
+    pass -- which is how a container missing the 3D-model library shipped in
+    KICAD_IMAGE. This cannot see inside the container; it can at least stop a
+    step that fails on any environment from reaching a user.
+    """
+    import shlex
+    import subprocess
+    import sys
+
+    project = tmp_path / "demo"
+    new_project(project)
+    for step in scaffold.CHECK_STEPS:
+        argv = shlex.split(step.command.format(design="src/demo.py"))
+        result = subprocess.run(
+            [sys.executable, "-m", "pcbkit.cli", *argv[1:]],
+            cwd=project,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"`{step.command}` fails on the untouched scaffold: "
+            f"{result.stdout}{result.stderr}"
+        )
+
+
+def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
+    """A workflow that runs `pcbkit doctor --strict` on a bare hosted runner
+    fails on its first run: KiCad 10 and pcbnew are not installed there."""
+    new_project(tmp_path / "demo")
+    path = tmp_path / "demo" / ".github" / "workflows" / "checks.yml"
+    workflow = path.read_text()
+    document = yaml.safe_load(workflow)
+
+    assert document["jobs"]["checks"]["container"]["image"] == scaffold.KICAD_IMAGE
+    # YAML 1.1 reads a bare `on:` key as the boolean true, hence the subscript.
+    assert "pull_request" in document[True]
+    for step in scaffold.CHECK_STEPS:
+        assert step.command.format(design="src/demo.py") in workflow
+
+
+def test_generated_ci_pins_kicad_to_the_confirmed_version(tmp_path):
+    """CR-004, and one version in one place. AGENTS.md rule 4 pins the file
+    formats against a specific KiCad; a container tag that drifted from it
+    would run the emitters against a KiCad those numbers were never confirmed
+    on."""
+    new_project(tmp_path / "demo")
+    path = tmp_path / "demo" / ".github" / "workflows" / "checks.yml"
+    document = yaml.safe_load(path.read_text())
+    assert not scaffold.KICAD_IMAGE.endswith(("latest", "nightly"))
+    # `-full` carries the 3D-model library; the plain tag does not, and
+    # `pcbkit doctor --strict` fails without it -- the workflow's first step.
+    assert scaffold.KICAD_IMAGE == f"kicad/kicad:{kicad.CONFIRMED_KICAD_VERSION}-full"
+    assert document["jobs"]["checks"]["container"]["image"] == scaffold.KICAD_IMAGE
+
+
+def test_the_container_job_can_write_the_workspace(tmp_path):
+    """The image's default user is `kicad` (uid 1000); a hosted runner owns the
+    mounted workspace as uid 1001. A container job that cannot check out is a
+    gate that cannot pass -- the failure this branch has already shipped once,
+    in the pinned ref that did not resolve."""
+    new_project(tmp_path / "demo")
+    path = tmp_path / "demo" / ".github" / "workflows" / "checks.yml"
+    container = yaml.safe_load(path.read_text())["jobs"]["checks"]["container"]
+    assert "--user root" in container["options"]
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "main pcbkit doctor; echo PWNED",
+        "main && curl attacker.example",
+        "main\nrun: echo hi",
+        "$(id)",
+        "`id`",
+        "main | tee /tmp/x",
+        "-upstream",
+        "a..b",
+        "refs/heads/x.lock",
+        "",
+        # A trailing newline is the whole of the injection: it lands in a `run:`
+        # line as a continuation at column 1 and the workflow stops parsing, so
+        # the generated gate can never report. Python's `$` matches before it.
+        "main\n",
+        "main\n\n",
+        "main\r",
+        "main\tv2",
+    ],
+)
+def test_a_ref_that_is_not_a_ref_is_refused(ref, tmp_path):
+    """The ref lands in a `run:` line of the generated workflow. A value that
+    is not a ref would put a command there that nobody wrote as one, in CI that
+    holds the project's secrets."""
+    envelope = new_project(tmp_path / "demo", pcbkit_ref=ref)
+    assert not envelope.ok
+    assert "invalid pcbkit ref" in envelope.errors[0]
+    # And nothing is left half-written.
+    assert not (tmp_path / "demo" / ".github").exists()
+
+
+@pytest.mark.parametrize(
+    "ref", ["main", "v1.2.3", "0123456789abcdef0123456789abcdef01234567", "release/1.x"]
+)
+def test_ordinary_refs_are_accepted(ref, tmp_path):
+    assert new_project(tmp_path / ref.replace("/", "-"), name="demo", pcbkit_ref=ref).ok
+
+
+@pytest.mark.parametrize("name", ["class", "def", "lambda", "import", "None"])
+def test_a_python_keyword_is_not_a_project_name(name, tmp_path):
+    """The name becomes `def {name}():` in the starter design, so a keyword
+    scaffolds a project whose first build is a SyntaxError -- a gate that
+    cannot pass, which is this branch's recurring defect. `match` is a soft
+    keyword and a legal function name, so it stays allowed."""
+    envelope = new_project(tmp_path / "proj", name=name)
+    assert not envelope.ok
+    assert "Python keyword" in envelope.errors[0]
+    assert new_project(tmp_path / "soft", name="match").ok
+
+
+@pytest.mark.parametrize(
+    "name", ["demo\n", "demo\nx", "demo\r", "1demo", "de mo", "demo;id", "demo\tx"]
+)
+def test_a_name_that_is_not_a_name_is_refused(name, tmp_path):
+    """The project name reaches a `run:` line, a TOML key and a filename. The
+    same anchored-`match` hole that let a ref carry a newline let a name carry
+    one, and this change is what gave the name that reach."""
+    envelope = new_project(tmp_path / "demo", name=name)
+    assert not envelope.ok
+    assert "invalid project name" in envelope.errors[0]
+    assert not (tmp_path / "demo" / ".github").exists()
+
+
+def test_the_default_pcbkit_ref_is_not_a_tag_this_project_lacks():
+    """A workflow whose first step cannot install pcbkit is a gate that can
+    never pass -- the same failure as naming a verb that does not exist.
+
+    pcbkit publishes no tags, so `v{__version__}` would be the pinned-and-
+    broken choice. This asserts the default is not a version tag; whether the
+    ref resolves is checked against the remote by hand, as the container tag
+    was, because a unit test must not need the network (CR-003).
+
+    It is also the tripwire for the limitation closing: the day pcbkit tags a
+    release and the default correctly becomes `v<version>`, this test fails and
+    the spec's "closes the moment pcbkit tags a release" is what it is failing
+    about. Edit it then, deliberately.
+    """
+    assert not scaffold.DEFAULT_PCBKIT_REF.startswith("v")
+    assert scaffold.DEFAULT_PCBKIT_REF != __version__
+
+
+def test_pcbkit_ref_is_pinnable_and_reaches_the_workflow(tmp_path):
+    """The honest default runs; pinning is a flag away rather than a broken
+    file away."""
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    new_project(tmp_path / "demo", pcbkit_ref=sha)
+    project = tmp_path / "demo"
+    workflow = (project / ".github" / "workflows" / "checks.yml").read_text()
+    assert f"@{sha}" in workflow
+    assert f"@{scaffold.DEFAULT_PCBKIT_REF}" not in workflow
+    # And the README must name the ref the project actually got, or it teaches
+    # the reader to trust a pin that is not there.
+    assert sha in (project / "README.md").read_text()
+
+
+def test_readme_says_the_default_ref_is_not_pinned(tmp_path):
+    """CR-004 is not satisfied by the default, and saying so is the difference
+    between a documented limitation and a silent one."""
+    new_project(tmp_path / "demo")
+    readme = (tmp_path / "demo" / "README.md").read_text()
+    assert scaffold.DEFAULT_PCBKIT_REF in readme
+    assert "--pcbkit-ref" in readme
+    assert "can change without the project changing" in readme
+
+
+def test_generated_workflow_is_valid_yaml(tmp_path):
+    """It is a Python f-string producing YAML, which is a shape that breaks
+    silently: the file only fails when a user pushes it."""
+    new_project(tmp_path / "demo")
+    parsed = yaml.safe_load(
+        (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
+    )
+    assert set(parsed["jobs"]) == {"checks", "gate"}
+    assert parsed["jobs"]["gate"]["needs"] == ["checks"]
+    # `edited` is what makes a deferral added to the body take effect.
+    # YAML 1.1 reads a bare `on:` key as the boolean true, hence the subscript.
+    assert "edited" in parsed[True]["pull_request"]["types"]
+
+
+def test_the_gate_job_does_not_drift_between_its_two_copies():
+    """This repository's own workflow and every generated one must run the same
+    deferral gate. Two copies of a rule are two rules, and the one nobody looks
+    at is the one that rots."""
+    ours = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "checks.yml").read_text()
+    assert scaffold.GATE_JOB in ours, (
+        "the gate job in .github/workflows/checks.yml has drifted from "
+        "pcbkit.core.scaffold.GATE_JOB"
+    )
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("deferred: checks\nwhy: layout lands later\nresolves: #42\n", "declared"),
+        # Field order is not load-bearing; requiring one would be a rule the
+        # error message does not state.
+        ("deferred: checks\nresolves: #42\nwhy: staged\n", "declared"),
+        # CRLF: GitHub delivers pull request bodies with Windows line endings.
+        ("prose\r\n\r\ndeferred: checks\r\nwhy: staged\r\nresolves: #42\r\n", "declared"),
+        ("deferred: checks\nwhy: staged\nresolves: 42\n", "declared"),
+        # A quoted example is a mention, not a declaration. This exact block
+        # appears inside a fence in the README pcbkit generates, so without
+        # this any pull request quoting its own docs would defer its own checks.
+        (
+            "Docs example:\n\n```\ndeferred: checks\nwhy: schematic adds USB-C\n"
+            "resolves: #42\n```\n",
+            "",
+        ),
+        ("~~~\ndeferred: checks\nwhy: x\nresolves: #42\n~~~\n", ""),
+        # And a hidden one is the quiet override the three lines exist to stop:
+        # the rendered body would show a one-line description and no deferral.
+        (
+            "Small cleanup.\n\n<!--\ndeferred: checks\nwhy: flaky runner\n"
+            "resolves: #1\n-->\n",
+            "",
+        ),
+        ("<!-- deferred: checks -->\nwhy: x\nresolves: #1\n", ""),
+        # Nested fences. Quoting a document that itself contains a fence needs
+        # a longer outer fence -- which is exactly the case the exclusion
+        # exists for, "a pull request citing its own documentation". A parity
+        # toggle would read the inner fence as a close and take the quoted
+        # example as live.
+        (
+            "Quoting the README:\n\n`````markdown\n```\ndeferred: checks\n"
+            "why: schematic adds USB-C\nresolves: #42\n```\n`````\n",
+            "",
+        ),
+        # Mixed delimiters: a ~~~ line does not close a ``` fence.
+        (
+            "```\n~~~\ndeferred: checks\nwhy: quoted only\nresolves: #42\n~~~\n```\n",
+            "",
+        ),
+        ("~~~\n```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n~~~\n", ""),
+        # Two backticks is not a fence, so what surrounds it still declares.
+        ("``\ndeferred: checks\nwhy: staged\nresolves: #42\n``\n", "declared"),
+        # Adjacent blocks with no blank line between them: the first must not
+        # be lost, or blank-line placement becomes load-bearing.
+        (
+            "deferred: checks\nwhy: a\nresolves: #1\n"
+            "deferred: drc\nwhy: b\nresolves: #2\n",
+            "declared",
+        ),
+        # A real declaration after a quoted one still counts.
+        (
+            "```\ndeferred: checks\nwhy: example\nresolves: #9\n```\n\n"
+            "deferred: checks\nwhy: the real one\nresolves: #42\n",
+            "declared",
+        ),
+        # Each missing or empty field is a malformed declaration, not an absent
+        # one: someone tried to defer and the gate must say why it did not take.
+        ("deferred: checks\nresolves: #42\n", "malformed"),
+        ("deferred: checks\nwhy:\nresolves: #42\n", "malformed"),
+        ("deferred: checks\nwhy: staged\nresolves: later\n", "malformed"),
+        ("deferred: checks\nwhy: staged\n", "malformed"),
+        # #0 names no issue, so it tracks nothing.
+        ("deferred: checks\nwhy: staged\nresolves: #0\n", "malformed"),
+        # A deferral of some other check does not excuse this one.
+        ("deferred: drc\nwhy: staged\nresolves: #42\n", ""),
+        ("an ordinary pull request body\n", ""),
+        ("  deferred: checks\n  why: x\n  resolves: #42\n", ""),
+        # CommonMark allows an info string on the *opening* fence only, so a
+        # ```js line inside a ``` block is content and not a close. Closing on
+        # it read the rest of a quoted document as live -- and a body pasting a
+        # chunk of markdown is exactly the case the exclusion exists for.
+        (
+            "```\n```js\ndeferred: checks\nwhy: quoted\nresolves: #42\n```\n",
+            "",
+        ),
+        # ...and a fence is therefore still open at the end of the body.
+        ("```\ndeferred: checks\nwhy: q\nresolves: #42\n```js\n", ""),
+        # One line can close a comment and open another. Two line-level rules
+        # cannot see the order, so this body -- which GitHub renders as the
+        # single word "Some text" -- was read as a live declaration.
+        (
+            "Some text --> <!--\ndeferred: checks\nwhy: hidden\n"
+            "resolves: #42\n-->\n",
+            "",
+        ),
+        # The same shape with nothing visible at all: GitHub renders this body
+        # as the empty string. An override taken this quietly is the one
+        # intent.md says is not a gate.
+        (
+            "<!-- note --> <!--\ndeferred: checks\nwhy: hidden\n"
+            "resolves: #42\n-->\n",
+            "",
+        ),
+        # The converse: a comment that ends before the declaration leaves it
+        # rendered, visible, and therefore a real declaration.
+        (
+            "<!-- note -->deferred: checks\nwhy: visible in the body\n"
+            "resolves: #42\n",
+            "declared",
+        ),
+        # A comment is not the only thing that renders as nothing. These are
+        # CommonMark raw-HTML block types 3, 4 and 5; GitHub drops all of them,
+        # so each of these bodies renders to the empty string. Confirmed
+        # against GitHub's own renderer, not against a reading of CommonMark.
+        ("<?\ndeferred: checks\nwhy: h\nresolves: #42\n?>\n", ""),
+        ("<?php\ndeferred: checks\nwhy: h\nresolves: #42\n?>\n", ""),
+        ("<![CDATA[\ndeferred: checks\nwhy: h\nresolves: #42\n]]>\n", ""),
+        ("<!DOCTYPE X\ndeferred: checks\nwhy: h\nresolves: #42\n>\n", ""),
+        # ...and each closed again leaves what follows visible.
+        ("<?php x ?>\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("<![CDATA[ x ]]>\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("<!DOCTYPE html>\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        # `<!` opens a raw-HTML block only before a letter, so these are text.
+        ("a <!-> b\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("5 <!3\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("-->\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        # GitHub escapes a <script> block rather than hiding it, so it renders
+        # and it declares. The rule is what a reader sees, not a tag list.
+        (
+            "<script>\ndeferred: checks\nwhy: v\nresolves: #42\n</script>\n",
+            "declared",
+        ),
+        # Four spaces is an indented code block, not a fence. As a close, the
+        # fence stays open and the body renders entirely as code; as an open,
+        # there is no fence and the declaration below renders as prose.
+        ("```\n    ```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n", ""),
+        ("```\n\t```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n", ""),
+        ("    ```\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        # Three is still a fence, in both positions.
+        ("   ```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n", ""),
+        ("```\n   ```\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+    ],
+)
+def test_deferral_parser(body, expected, tmp_path):
+    """The gate is a shell script in YAML, which nothing else here can test.
+    Extracting its awk program and running it is the only way to know it works
+    before it decides whether a real change may merge."""
+    import re
+    import subprocess
+
+    match = re.search(r"awk -v want=checks '\n(.*?)\n\s*'\)", scaffold.GATE_JOB, re.S)
+    assert match, "could not extract the awk program from GATE_JOB"
+    program = textwrap.dedent(match.group(1))
+
+    script = tmp_path / "gate.awk"
+    script.write_text(program)
+    result = subprocess.run(
+        ["awk", "-v", "want=checks", "-f", str(script)],
+        input=body.replace("\r", ""),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == expected
+
+
+def test_readme_names_the_settings_pcbkit_cannot_enable(tmp_path):
+    """pcbkit produces the workflow and documents the rest rather than
+    pretending it configured the repository."""
+    new_project(tmp_path / "demo")
+    readme = (tmp_path / "demo" / "README.md").read_text()
+
+    for context in scaffold.REQUIRED_CONTEXTS:
+        assert f"`{context}`" in readme
+    assert "Require a pull request before merging" in readme
+    # The reader must be told the workflow alone blocks nothing.
+    assert "does not block" in readme
+
+    # Requiring a context nothing produces blocks every merge, so the caveat
+    # has to come before the list a reader is about to act on -- not after it.
+    caveat = readme.index("only if you add a review workflow of your own")
+    numbered = readme.index("1. Require a pull request before merging")
+    assert caveat < numbered, "the caveat must precede the settings it qualifies"
+
+    # The escape hatch has to be documented where someone hitting a red check
+    # will look, or they will reach for an admin bypass instead.
+    assert "deferred: checks" in readme
+    assert "resolves: #42" in readme
+    # Including the two rules a reader cannot infer from the example.
+    assert "order does not matter" in readme
+    assert "code fence" in readme
+
+
+def test_generated_project_documents_what_is_not_committed(tmp_path):
+    """CR-005. The README and the .gitignore must agree, or one of them is
+    teaching the wrong habit."""
+    new_project(tmp_path / "demo")
+    project = tmp_path / "demo"
+    readme = (project / "README.md").read_text()
+    ignored = (project / ".gitignore").read_text()
+
+    assert "demo.kicad_dru" in readme
+    assert "*.kicad_dru" in ignored
+    # The workflow and README are project source, so they must not be ignored.
+    assert "README" not in ignored
+    assert ".github" not in ignored
