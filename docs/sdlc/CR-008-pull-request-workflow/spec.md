@@ -200,11 +200,33 @@ all, which is exactly the override taken quietly that `intent.md` rejects. The
 declaration has to be visible to the person reading the pull request, or it is
 not a record.
 
-The fence is matched by **delimiter and run length**, not by toggling a bit on
-every fence-looking line. Quoting a document that already contains a fence needs
-a longer outer fence, and a parity toggle would read the inner one as a close —
-so the quoted example would declare after all, one nesting level up. A `~~~`
-line likewise does not close a ``` fence.
+Both exclusions are decided **within the line**, not by a rule per line. Each
+of the three defects found here was a line that did two things at once, and a
+per-line rule cannot see the second one.
+
+The fence is matched by **delimiter and run length**, and closes only on a line
+carrying the delimiter and nothing else. Quoting a document that already
+contains a fence needs a longer outer fence, so a parity toggle would read the
+inner one as a close and the quoted example would declare after all. A `~~~`
+line likewise does not close a ``` fence. And CommonMark permits an info string
+on the *opening* fence only, so a ```` ```js ```` line inside a ``` block is
+content: closing on it read the rest of a quoted document as live declarations,
+and a body pasting a chunk of markdown is precisely the case this exists for.
+
+HTML comments are scanned in order across the line, because a single line can
+close one comment and open another. Two independent line-level rules see only
+that the line contains both `<!--` and `-->`, and conclude the comment ended —
+so `<!-- note --> <!--` left everything below it live. That body renders as
+nothing at all: a pull request whose visible description is empty, deferring its
+own checks with a warning in a log nobody reads.
+
+What survives that scan is what a reader sees, which is the actual rule. A
+declaration after a closed comment on the same line — `<!-- note -->deferred:
+checks` — *does* declare, because it renders. The one place the rule is
+enumerated rather than derived is `<details>`: a declaration inside one is taken,
+and it renders inside a collapsed disclosure. That is deliberate. A disclosure
+triangle is visible, the reader can open it, and the text is in the body
+permanently; a comment is none of those things.
 
 An unbalanced fence, or a literal `<!--` with no closing `-->`, hides everything
 after it. That fails closed — the declaration below is not seen and the gate
@@ -262,6 +284,12 @@ gate. The container tag derives from `CONFIRMED_KICAD_VERSION`, the single
 constant AGENTS.md rule 4's format numbers are pinned against, and was checked
 against the registry rather than assumed.
 
+The container job runs as root. The image's own default user is `kicad`, uid
+1000, while a hosted runner owns the mounted workspace as uid 1001 — so
+`actions/checkout` cannot write it and the job dies before the first verb runs.
+That is the same class as the ref that did not resolve: a gate that cannot pass,
+found by reading the image config rather than by assuming it.
+
 **pcbkit's own ref is the one place this milestone does not achieve CR-004, and
 it says so.** Pinning to `v<version>` would be correct, but pcbkit publishes no
 tags, so that ref does not resolve and every generated project's first CI run
@@ -275,7 +303,19 @@ closes the moment pcbkit tags a release.
 The ref is validated before it is written. It lands in a `run:` line, so a value
 that is not a ref would put a command in a workflow step that nobody wrote as
 one, in CI holding that project's secrets. `pcbkit new --pcbkit-ref 'main; curl
-…'` is refused with a finding, and nothing is written.
+…'` is refused and nothing is written — as an `errors[]` entry rather than a
+`findings[]` one, matching the pre-existing name check: a malformed argument is
+a usage error, not something observed about a board (rule 3).
+
+The project name is validated the same way and for the same reason, since this
+change is what first routes it into a `run:` line.
+
+Both are matched with `re.fullmatch`. An anchored `re.match` is not equivalent:
+in Python `$` matches at the end of the string *or immediately before a trailing
+newline*, so `--pcbkit-ref $'main\n'` passed a pattern written to keep exactly
+that out. The newline landed in the workflow as a continuation at column 1,
+`pcbkit new` reported success, and the emitted file was one GitHub Actions
+cannot parse — a generated gate that can never report.
 
 The `gate` job is shared verbatim between this repository's workflow and every
 generated one, pinned by a test. Two copies of a rule are two rules, and the one
@@ -311,7 +351,8 @@ rather than glossed over.
 - `gate` fails when `checks` is red and nothing declares it, and passes when a
   complete `deferred:` block names it, in either field order. An incomplete
   block fails, and a block inside a code fence or an HTML comment does not
-  declare anything.
+  declare anything — including a fence whose inner line carries an info string,
+  and a line that closes one comment and opens another.
 - A comment whose last line is `VERDICT: APPROVE` and which names the head
   commit sets the `agent-review` status on that SHA; pushing a further commit
   clears it, and editing the old comment does not restore it.

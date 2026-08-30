@@ -62,20 +62,47 @@ jobs:
             # README would otherwise defer its own checks, and one hiding the block in a
             # comment would defer them with nothing visible on the page.
             #
-            # The fence is matched by delimiter and run length, not toggled: quoting a
-            # document that itself contains a fence needs a longer outer fence, and a
-            # parity toggle would treat the inner one as a close and read the quoted
-            # example as a live declaration.
-            match($0, /^[[:space:]]*(```+|~~~+)/) {
-              run = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*/, "", run)
-              ch = substr(run, 1, 1)
-              if (!fence) { fence = 1; fence_ch = ch; fence_len = length(run) }
-              else if (ch == fence_ch && length(run) >= fence_len) { fence = 0 }
-              next
+            # Both exclusions are decided within the line rather than by a rule per line,
+            # because a line that does two things at once defeated both of the earlier
+            # per-line versions. What is left after this block is what a reader sees.
+            {
+              # A fence closes only on a line carrying the delimiter and nothing else.
+              # CommonMark allows an info string on the *opening* fence only, so a
+              # ```js line inside a ``` block is content -- closing on it read the rest
+              # of a quoted document as live declarations. Delimiter and run length are
+              # compared too, because quoting a document that itself contains a fence
+              # needs a longer outer fence and the inner one must not close it.
+              if (fence) {
+                if (match($0, /^[[:space:]]*(```+|~~~+)[[:space:]]*$/)) {
+                  run = $0; sub(/^[[:space:]]*/, "", run); sub(/[[:space:]]*$/, "", run)
+                  if (substr(run, 1, 1) == fence_ch && length(run) >= fence_len) fence = 0
+                }
+                next
+              }
+              if (!comment && match($0, /^[[:space:]]*(```+|~~~+)/)) {
+                run = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*/, "", run)
+                fence = 1; fence_ch = substr(run, 1, 1); fence_len = length(run)
+                next
+              }
+
+              # Comments are scanned in order across the line. Two line-level rules
+              # cannot see that `--> <!--` closes one comment and opens another, and a
+              # body that rendered to nothing at all was read as a live declaration.
+              rest = $0; visible = ""
+              while (length(rest) > 0) {
+                if (comment) {
+                  p = index(rest, "-->")
+                  if (p == 0) { rest = ""; break }
+                  rest = substr(rest, p + 3); comment = 0
+                } else {
+                  p = index(rest, "<!--")
+                  if (p == 0) { visible = visible rest; rest = ""; break }
+                  visible = visible substr(rest, 1, p - 1)
+                  rest = substr(rest, p + 4); comment = 1
+                }
+              }
+              $0 = visible
             }
-            fence { next }
-            /<!--/ { comment = 1 }
-            comment { if (/-->/) comment = 0; next }
 
             function judge() {
               if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) return "declared"

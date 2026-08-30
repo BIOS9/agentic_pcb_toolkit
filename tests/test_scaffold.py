@@ -9,6 +9,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 from pcbkit import __version__
 from pcbkit.cli import main
@@ -259,10 +260,13 @@ def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
     """A workflow that runs `pcbkit doctor --strict` on a bare hosted runner
     fails on its first run: KiCad 10 and pcbnew are not installed there."""
     new_project(tmp_path / "demo")
-    workflow = (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
+    path = tmp_path / "demo" / ".github" / "workflows" / "checks.yml"
+    workflow = path.read_text()
+    document = yaml.safe_load(workflow)
 
-    assert f"container: {scaffold.KICAD_IMAGE}" in workflow
-    assert "pull_request:" in workflow
+    assert document["jobs"]["checks"]["container"]["image"] == scaffold.KICAD_IMAGE
+    # YAML 1.1 reads a bare `on:` key as the boolean true, hence the subscript.
+    assert "pull_request" in document[True]
     for step in scaffold.CHECK_STEPS:
         assert step.command.format(design="src/demo.py") in workflow
 
@@ -273,10 +277,22 @@ def test_generated_ci_pins_kicad_to_the_confirmed_version(tmp_path):
     would run the emitters against a KiCad those numbers were never confirmed
     on."""
     new_project(tmp_path / "demo")
-    workflow = (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
+    path = tmp_path / "demo" / ".github" / "workflows" / "checks.yml"
+    document = yaml.safe_load(path.read_text())
     assert not scaffold.KICAD_IMAGE.endswith(("latest", "nightly"))
     assert scaffold.KICAD_IMAGE.endswith(f":{kicad.CONFIRMED_KICAD_VERSION}")
-    assert f"container: {scaffold.KICAD_IMAGE}" in workflow
+    assert document["jobs"]["checks"]["container"]["image"] == scaffold.KICAD_IMAGE
+
+
+def test_the_container_job_can_write_the_workspace(tmp_path):
+    """The image's default user is `kicad` (uid 1000); a hosted runner owns the
+    mounted workspace as uid 1001. A container job that cannot check out is a
+    gate that cannot pass -- the failure this branch has already shipped once,
+    in the pinned ref that did not resolve."""
+    new_project(tmp_path / "demo")
+    path = tmp_path / "demo" / ".github" / "workflows" / "checks.yml"
+    container = yaml.safe_load(path.read_text())["jobs"]["checks"]["container"]
+    assert "--user root" in container["options"]
 
 
 @pytest.mark.parametrize(
@@ -292,6 +308,13 @@ def test_generated_ci_pins_kicad_to_the_confirmed_version(tmp_path):
         "a..b",
         "refs/heads/x.lock",
         "",
+        # A trailing newline is the whole of the injection: it lands in a `run:`
+        # line as a continuation at column 1 and the workflow stops parsing, so
+        # the generated gate can never report. Python's `$` matches before it.
+        "main\n",
+        "main\n\n",
+        "main\r",
+        "main\tv2",
     ],
 )
 def test_a_ref_that_is_not_a_ref_is_refused(ref, tmp_path):
@@ -312,7 +335,20 @@ def test_ordinary_refs_are_accepted(ref, tmp_path):
     assert new_project(tmp_path / ref.replace("/", "-"), name="demo", pcbkit_ref=ref).ok
 
 
-def test_the_default_pcbkit_ref_is_one_that_resolves():
+@pytest.mark.parametrize(
+    "name", ["demo\n", "demo\nx", "demo\r", "1demo", "de mo", "demo;id", "demo\tx"]
+)
+def test_a_name_that_is_not_a_name_is_refused(name, tmp_path):
+    """The project name reaches a `run:` line, a TOML key and a filename. The
+    same anchored-`match` hole that let a ref carry a newline let a name carry
+    one, and this change is what gave the name that reach."""
+    envelope = new_project(tmp_path / "demo", name=name)
+    assert not envelope.ok
+    assert "invalid project name" in envelope.errors[0]
+    assert not (tmp_path / "demo" / ".github").exists()
+
+
+def test_the_default_pcbkit_ref_is_not_a_tag_this_project_lacks():
     """A workflow whose first step cannot install pcbkit is a gate that can
     never pass -- the same failure as naming a verb that does not exist.
 
@@ -352,8 +388,6 @@ def test_readme_says_the_default_ref_is_not_pinned(tmp_path):
 def test_generated_workflow_is_valid_yaml(tmp_path):
     """It is a Python f-string producing YAML, which is a shape that breaks
     silently: the file only fails when a user pushes it."""
-    import yaml
-
     new_project(tmp_path / "demo")
     parsed = yaml.safe_load(
         (tmp_path / "demo" / ".github" / "workflows" / "checks.yml").read_text()
@@ -446,6 +480,39 @@ def test_the_gate_job_has_exactly_one_definition():
         ("deferred: drc\nwhy: staged\nresolves: #42\n", ""),
         ("an ordinary pull request body\n", ""),
         ("  deferred: checks\n  why: x\n  resolves: #42\n", ""),
+        # CommonMark allows an info string on the *opening* fence only, so a
+        # ```js line inside a ``` block is content and not a close. Closing on
+        # it read the rest of a quoted document as live -- and a body pasting a
+        # chunk of markdown is exactly the case the exclusion exists for.
+        (
+            "```\n```js\ndeferred: checks\nwhy: quoted\nresolves: #42\n```\n",
+            "",
+        ),
+        # ...and a fence is therefore still open at the end of the body.
+        ("```\ndeferred: checks\nwhy: q\nresolves: #42\n```js\n", ""),
+        # One line can close a comment and open another. Two line-level rules
+        # cannot see the order, so this body -- which GitHub renders as the
+        # single word "Some text" -- was read as a live declaration.
+        (
+            "Some text --> <!--\ndeferred: checks\nwhy: hidden\n"
+            "resolves: #42\n-->\n",
+            "",
+        ),
+        # The same shape with nothing visible at all: GitHub renders this body
+        # as the empty string. An override taken this quietly is the one
+        # intent.md says is not a gate.
+        (
+            "<!-- note --> <!--\ndeferred: checks\nwhy: hidden\n"
+            "resolves: #42\n-->\n",
+            "",
+        ),
+        # The converse: a comment that ends before the declaration leaves it
+        # rendered, visible, and therefore a real declaration.
+        (
+            "<!-- note -->deferred: checks\nwhy: visible in the body\n"
+            "resolves: #42\n",
+            "declared",
+        ),
     ],
 )
 def test_deferral_parser(body, expected, tmp_path):

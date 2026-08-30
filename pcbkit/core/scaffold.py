@@ -124,20 +124,47 @@ GATE_JOB = """\
             # README would otherwise defer its own checks, and one hiding the block in a
             # comment would defer them with nothing visible on the page.
             #
-            # The fence is matched by delimiter and run length, not toggled: quoting a
-            # document that itself contains a fence needs a longer outer fence, and a
-            # parity toggle would treat the inner one as a close and read the quoted
-            # example as a live declaration.
-            match($0, /^[[:space:]]*(```+|~~~+)/) {
-              run = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*/, "", run)
-              ch = substr(run, 1, 1)
-              if (!fence) { fence = 1; fence_ch = ch; fence_len = length(run) }
-              else if (ch == fence_ch && length(run) >= fence_len) { fence = 0 }
-              next
+            # Both exclusions are decided within the line rather than by a rule per line,
+            # because a line that does two things at once defeated both of the earlier
+            # per-line versions. What is left after this block is what a reader sees.
+            {
+              # A fence closes only on a line carrying the delimiter and nothing else.
+              # CommonMark allows an info string on the *opening* fence only, so a
+              # ```js line inside a ``` block is content -- closing on it read the rest
+              # of a quoted document as live declarations. Delimiter and run length are
+              # compared too, because quoting a document that itself contains a fence
+              # needs a longer outer fence and the inner one must not close it.
+              if (fence) {
+                if (match($0, /^[[:space:]]*(```+|~~~+)[[:space:]]*$/)) {
+                  run = $0; sub(/^[[:space:]]*/, "", run); sub(/[[:space:]]*$/, "", run)
+                  if (substr(run, 1, 1) == fence_ch && length(run) >= fence_len) fence = 0
+                }
+                next
+              }
+              if (!comment && match($0, /^[[:space:]]*(```+|~~~+)/)) {
+                run = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*/, "", run)
+                fence = 1; fence_ch = substr(run, 1, 1); fence_len = length(run)
+                next
+              }
+
+              # Comments are scanned in order across the line. Two line-level rules
+              # cannot see that `--> <!--` closes one comment and opens another, and a
+              # body that rendered to nothing at all was read as a live declaration.
+              rest = $0; visible = ""
+              while (length(rest) > 0) {
+                if (comment) {
+                  p = index(rest, "-->")
+                  if (p == 0) { rest = ""; break }
+                  rest = substr(rest, p + 3); comment = 0
+                } else {
+                  p = index(rest, "<!--")
+                  if (p == 0) { visible = visible rest; rest = ""; break }
+                  visible = visible substr(rest, 1, p - 1)
+                  rest = substr(rest, p + 4); comment = 1
+                }
+              }
+              $0 = visible
             }
-            fence { next }
-            /<!--/ { comment = 1 }
-            comment { if (/-->/) comment = 0; next }
 
             function judge() {
               if (name == want && why != "" && res ~ /^#?[1-9][0-9]*$/) return "declared"
@@ -226,9 +253,9 @@ def _workflow(name: str, ref: str) -> str:
 
     * KiCad 10 and its `pcbnew` module are not on the hosted runner image, so
       the job runs inside the fabricator-independent KiCad container.
-    * pcbkit is not published, so it is fetched from source at the version that
-      generated this project. Pinned, for the same reason the profile is copied
-      rather than referenced.
+    * pcbkit is not published, so it is fetched from source. The default ref is
+      the default branch and is therefore *not* a pin -- pcbkit has no tags to
+      pin to. `--pcbkit-ref` takes one, and the README states which it got.
     """
     steps = "\n".join(
         f"      - name: {step.label}\n        run: {_runner(ref)} {step.command.format(design=f'src/{name}.py')}"
@@ -262,7 +289,12 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    container: {KICAD_IMAGE}
+    container:
+      image: {KICAD_IMAGE}
+      # The image's default user is `kicad` (uid 1000); a hosted runner owns the
+      # mounted workspace as uid 1001, so checkout cannot write it. A container
+      # job that cannot check out is a gate that cannot pass.
+      options: --user root
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -292,7 +324,7 @@ def _readme(name: str, profile: Profile, process_id: str, ref: str) -> str:
 
     # A 40-character hash or a version tag is a pin; anything else is a moving
     # ref, and the difference is the whole of CR-004 for this project.
-    pinned = bool(re.fullmatch(r"[0-9a-f]{40}|v[0-9].*", ref))
+    pinned = bool(re.fullmatch(r"[0-9a-fA-F]{40}|v?[0-9].*", ref))
     if pinned:
         ref_note = _wrap(
             f"pcbkit itself is pinned at `{ref}`, so this project's CI result "
@@ -402,17 +434,20 @@ which a mistake starts costing money.
 """
 
 
-_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+# Matched with `fullmatch`, never `match`: in Python `$` also matches just
+# before a trailing newline, so an anchored `match` accepts `demo\n` -- which
+# reaches a `run:` line and a TOML key and breaks both.
+_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 
 # The ref is interpolated into a `run:` line of the generated workflow, so it
 # has to be a ref and not a command. A conservative subset of what git accepts:
 # anything outside it either is not a valid ref anyway or would turn a workflow
 # step into something its reader did not write.
-_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
 def valid_ref(ref: str) -> bool:
-    return bool(_REF_RE.match(ref)) and ".." not in ref and not ref.endswith(".lock")
+    return bool(_REF_RE.fullmatch(ref)) and ".." not in ref and not ref.endswith(".lock")
 
 
 def _starter_design(name: str) -> str:
@@ -474,7 +509,7 @@ def new_project(
     directory = Path(directory)
     name = name or directory.name
 
-    if not _NAME_RE.match(name):
+    if not _NAME_RE.fullmatch(name):
         return Envelope(
             command="new",
             ok=False,
