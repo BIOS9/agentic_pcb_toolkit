@@ -236,15 +236,16 @@ def test_the_gating_step_actually_fails_a_broken_project(tmp_path):
     gating = [step for step in scaffold.CHECK_STEPS if step.gates]
     argv = shlex.split(gating[0].command.format(design="src/demo.py"))
 
-    def run() -> int:
-        return subprocess.run(
+    def run() -> tuple[int, str]:
+        result = subprocess.run(
             [sys.executable, "-m", "pcbkit.cli", *argv[1:]],
             cwd=project,
             capture_output=True,
             text=True,
-        ).returncode
+        )
+        return result.returncode, result.stdout + result.stderr
 
-    assert run() == 0, "the scaffold as generated must pass its own gate"
+    assert run()[0] == 0, "the scaffold as generated must pass its own gate"
 
     design = project / "src" / "demo.py"
     design.write_text(
@@ -253,7 +254,40 @@ def test_the_gating_step_actually_fails_a_broken_project(tmp_path):
             "    orphan = R('10k', pkg='0603')   # connected to nothing",
         )
     )
-    assert run() == 1, "an unconnected part must fail the gate"
+    code, out = run()
+    assert code == 1, "an unconnected part must fail the gate"
+    # The exit code alone would also be satisfied by a SyntaxError, which would
+    # make this pass while testing nothing about the gate.
+    assert "unconnected" in out, f"failed for the wrong reason: {out}"
+
+
+def test_every_generated_step_runs_against_the_scaffold(tmp_path):
+    """Not only the gating one.
+
+    `pcbkit doctor --strict` and `pcbkit profile regenerate .` were executed by
+    no test at all, and a first step that cannot pass is a gate that cannot
+    pass -- which is how a container missing the 3D-model library shipped in
+    KICAD_IMAGE. This cannot see inside the container; it can at least stop a
+    step that fails on any environment from reaching a user.
+    """
+    import shlex
+    import subprocess
+    import sys
+
+    project = tmp_path / "demo"
+    new_project(project)
+    for step in scaffold.CHECK_STEPS:
+        argv = shlex.split(step.command.format(design="src/demo.py"))
+        result = subprocess.run(
+            [sys.executable, "-m", "pcbkit.cli", *argv[1:]],
+            cwd=project,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"`{step.command}` fails on the untouched scaffold: "
+            f"{result.stdout}{result.stderr}"
+        )
 
 
 def test_generated_workflow_supplies_kicad_and_pcbkit(tmp_path):
@@ -280,7 +314,9 @@ def test_generated_ci_pins_kicad_to_the_confirmed_version(tmp_path):
     path = tmp_path / "demo" / ".github" / "workflows" / "checks.yml"
     document = yaml.safe_load(path.read_text())
     assert not scaffold.KICAD_IMAGE.endswith(("latest", "nightly"))
-    assert scaffold.KICAD_IMAGE.endswith(f":{kicad.CONFIRMED_KICAD_VERSION}")
+    # `-full` carries the 3D-model library; the plain tag does not, and
+    # `pcbkit doctor --strict` fails without it -- the workflow's first step.
+    assert scaffold.KICAD_IMAGE == f"kicad/kicad:{kicad.CONFIRMED_KICAD_VERSION}-full"
     assert document["jobs"]["checks"]["container"]["image"] == scaffold.KICAD_IMAGE
 
 
@@ -335,6 +371,18 @@ def test_ordinary_refs_are_accepted(ref, tmp_path):
     assert new_project(tmp_path / ref.replace("/", "-"), name="demo", pcbkit_ref=ref).ok
 
 
+@pytest.mark.parametrize("name", ["class", "def", "lambda", "import", "None"])
+def test_a_python_keyword_is_not_a_project_name(name, tmp_path):
+    """The name becomes `def {name}():` in the starter design, so a keyword
+    scaffolds a project whose first build is a SyntaxError -- a gate that
+    cannot pass, which is this branch's recurring defect. `match` is a soft
+    keyword and a legal function name, so it stays allowed."""
+    envelope = new_project(tmp_path / "proj", name=name)
+    assert not envelope.ok
+    assert "Python keyword" in envelope.errors[0]
+    assert new_project(tmp_path / "soft", name="match").ok
+
+
 @pytest.mark.parametrize(
     "name", ["demo\n", "demo\nx", "demo\r", "1demo", "de mo", "demo;id", "demo\tx"]
 )
@@ -356,6 +404,11 @@ def test_the_default_pcbkit_ref_is_not_a_tag_this_project_lacks():
     broken choice. This asserts the default is not a version tag; whether the
     ref resolves is checked against the remote by hand, as the container tag
     was, because a unit test must not need the network (CR-003).
+
+    It is also the tripwire for the limitation closing: the day pcbkit tags a
+    release and the default correctly becomes `v<version>`, this test fails and
+    the spec's "closes the moment pcbkit tags a release" is what it is failing
+    about. Edit it then, deliberately.
     """
     assert not scaffold.DEFAULT_PCBKIT_REF.startswith("v")
     assert scaffold.DEFAULT_PCBKIT_REF != __version__
@@ -399,7 +452,7 @@ def test_generated_workflow_is_valid_yaml(tmp_path):
     assert "edited" in parsed[True]["pull_request"]["types"]
 
 
-def test_the_gate_job_has_exactly_one_definition():
+def test_the_gate_job_does_not_drift_between_its_two_copies():
     """This repository's own workflow and every generated one must run the same
     deferral gate. Two copies of a rule are two rules, and the one nobody looks
     at is the one that rots."""
@@ -513,6 +566,37 @@ def test_the_gate_job_has_exactly_one_definition():
             "resolves: #42\n",
             "declared",
         ),
+        # A comment is not the only thing that renders as nothing. These are
+        # CommonMark raw-HTML block types 3, 4 and 5; GitHub drops all of them,
+        # so each of these bodies renders to the empty string. Confirmed
+        # against GitHub's own renderer, not against a reading of CommonMark.
+        ("<?\ndeferred: checks\nwhy: h\nresolves: #42\n?>\n", ""),
+        ("<?php\ndeferred: checks\nwhy: h\nresolves: #42\n?>\n", ""),
+        ("<![CDATA[\ndeferred: checks\nwhy: h\nresolves: #42\n]]>\n", ""),
+        ("<!DOCTYPE X\ndeferred: checks\nwhy: h\nresolves: #42\n>\n", ""),
+        # ...and each closed again leaves what follows visible.
+        ("<?php x ?>\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("<![CDATA[ x ]]>\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("<!DOCTYPE html>\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        # `<!` opens a raw-HTML block only before a letter, so these are text.
+        ("a <!-> b\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("5 <!3\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        ("-->\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        # GitHub escapes a <script> block rather than hiding it, so it renders
+        # and it declares. The rule is what a reader sees, not a tag list.
+        (
+            "<script>\ndeferred: checks\nwhy: v\nresolves: #42\n</script>\n",
+            "declared",
+        ),
+        # Four spaces is an indented code block, not a fence. As a close, the
+        # fence stays open and the body renders entirely as code; as an open,
+        # there is no fence and the declaration below renders as prose.
+        ("```\n    ```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n", ""),
+        ("```\n\t```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n", ""),
+        ("    ```\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
+        # Three is still a fence, in both positions.
+        ("   ```\ndeferred: checks\nwhy: q\nresolves: #42\n```\n", ""),
+        ("```\n   ```\ndeferred: checks\nwhy: v\nresolves: #42\n", "declared"),
     ],
 )
 def test_deferral_parser(body, expected, tmp_path):

@@ -8,6 +8,7 @@ defaults (CR-006). Both are produced here so neither depends on remembering.
 from __future__ import annotations
 
 import datetime as _dt
+import keyword
 import re
 import tomllib
 from pathlib import Path
@@ -47,11 +48,20 @@ REQUIRED_CONTEXTS = ("gate", "agent-review")
 # produces output that differs between machines and nobody notices until it
 # matters.
 #
-# The tag was confirmed to exist on the registry on 2026-08-29. A generated
-# workflow whose container does not resolve is a gate that cannot pass, which
-# is the same failure as naming a verb that does not exist -- so re-confirm it
-# when CONFIRMED_KICAD_VERSION moves.
-KICAD_IMAGE = f"kicad/kicad:{CONFIRMED_KICAD_VERSION}"
+# The `-full` variant, and that suffix is load-bearing. The plain
+# `kicad/kicad:<version>` image ships no 3D-model library at all, and
+# `env.3dmodels` is a fail-severity check -- so `pcbkit doctor --strict`, the
+# generated workflow's first step, exits 1 on a project nobody has touched.
+# Every scaffolded repository would get CI that is red before a circuit is
+# written, and a required `gate` satisfiable only by deferring a check that was
+# never broken.
+#
+# Confirmed on 2026-08-30 by running the emitted steps inside the image, not by
+# resolving its name: `10.0.5` has 0 model directories and step one exits 1;
+# `10.0.5-full` has 105 and all three steps exit 0. Resolving the tag is what
+# was checked last time, and it is not the same question -- re-run the steps,
+# not just the tag, when CONFIRMED_KICAD_VERSION moves.
+KICAD_IMAGE = f"kicad/kicad:{CONFIRMED_KICAD_VERSION}-full"
 
 # pcbkit is not on a package index yet, so a generated project fetches it from
 # source.
@@ -127,6 +137,33 @@ GATE_JOB = """\
             # Both exclusions are decided within the line rather than by a rule per line,
             # because a line that does two things at once defeated both of the earlier
             # per-line versions. What is left after this block is what a reader sees.
+            #
+            # An HTML comment is not the only thing that renders as nothing: CommonMark
+            # has four raw-HTML openers GitHub drops entirely, each with its own
+            # terminator, and a declaration under any of them is invisible on the page.
+            # Longest first, so `<![CDATA[` is not read as a bare `<!`.
+            BEGIN {
+              n_html = 4
+              open_tok[1] = "<![CDATA["; close_for[1] = "]]>"
+              open_tok[2] = "<!--";      close_for[2] = "-->"
+              open_tok[3] = "<!";        close_for[3] = ">"
+              open_tok[4] = "<?";        close_for[4] = "?>"
+            }
+
+            # `<!` opens a raw-HTML block only when a letter follows it, so `<!-->` and
+            # a stray `<!` in prose are text. Without the check the gate would hide a
+            # declaration a reader can plainly see.
+            function find_open(s, tok,   at, base, hit) {
+              base = 0
+              while (1) {
+                hit = index(substr(s, base + 1), tok)
+                if (hit == 0) return 0
+                at = base + hit
+                if (tok != "<!" || substr(s, at + 2, 1) ~ /^[A-Za-z]$/) return at
+                base = at
+              }
+            }
+
             {
               # A fence closes only on a line carrying the delimiter and nothing else.
               # CommonMark allows an info string on the *opening* fence only, so a
@@ -134,34 +171,44 @@ GATE_JOB = """\
               # of a quoted document as live declarations. Delimiter and run length are
               # compared too, because quoting a document that itself contains a fence
               # needs a longer outer fence and the inner one must not close it.
+              #
+              # At most three spaces of indent, on both the open and the close: four is
+              # an indented code block, so ` ? ? ?` is what separates a fence from a
+              # line that only looks like one. Written out rather than as an interval
+              # expression, which mawk -- the awk on a hosted runner -- does not have.
               if (fence) {
-                if (match($0, /^[[:space:]]*(```+|~~~+)[[:space:]]*$/)) {
-                  run = $0; sub(/^[[:space:]]*/, "", run); sub(/[[:space:]]*$/, "", run)
+                if (match($0, /^ ? ? ?(```+|~~~+)[[:space:]]*$/)) {
+                  run = $0; sub(/^ ? ? ?/, "", run); sub(/[[:space:]]*$/, "", run)
                   if (substr(run, 1, 1) == fence_ch && length(run) >= fence_len) fence = 0
                 }
                 next
               }
-              if (!comment && match($0, /^[[:space:]]*(```+|~~~+)/)) {
-                run = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*/, "", run)
+              if (!hidden && match($0, /^ ? ? ?(```+|~~~+)/)) {
+                run = substr($0, RSTART, RLENGTH); sub(/^ ? ? ?/, "", run)
                 fence = 1; fence_ch = substr(run, 1, 1); fence_len = length(run)
                 next
               }
 
-              # Comments are scanned in order across the line. Two line-level rules
-              # cannot see that `--> <!--` closes one comment and opens another, and a
+              # Raw HTML is scanned in order across the line. Two line-level rules
+              # cannot see that `--> <!--` closes one span and opens another, and a
               # body that rendered to nothing at all was read as a live declaration.
               rest = $0; visible = ""
               while (length(rest) > 0) {
-                if (comment) {
-                  p = index(rest, "-->")
-                  if (p == 0) { rest = ""; break }
-                  rest = substr(rest, p + 3); comment = 0
-                } else {
-                  p = index(rest, "<!--")
-                  if (p == 0) { visible = visible rest; rest = ""; break }
-                  visible = visible substr(rest, 1, p - 1)
-                  rest = substr(rest, p + 4); comment = 1
+                if (hidden) {
+                  at = index(rest, close_tok)
+                  if (at == 0) { rest = ""; break }
+                  rest = substr(rest, at + length(close_tok)); hidden = 0
+                  continue
                 }
+                first = 0
+                for (i = 1; i <= n_html; i++) {
+                  at = find_open(rest, open_tok[i])
+                  if (at > 0 && (first == 0 || at < first)) { first = at; which = i }
+                }
+                if (first == 0) { visible = visible rest; rest = ""; break }
+                visible = visible substr(rest, 1, first - 1)
+                rest = substr(rest, first + length(open_tok[which]))
+                close_tok = close_for[which]; hidden = 1
               }
               $0 = visible
             }
@@ -199,7 +246,7 @@ GATE_JOB = """\
             malformed)
               echo "::error::the deferral for 'checks' is incomplete"
               echo "::error::it needs all three lines: 'deferred: checks', a non-empty 'why:', and 'resolves: #<issue>'"
-              echo "::error::order does not matter; a block inside a code fence or an HTML comment does not count"
+              echo "::error::order does not matter; a block inside a code fence or raw HTML does not count"
               exit 1 ;;
             *)
               echo "::error::checks is '$RESULT' and no deferral declares it"
@@ -207,8 +254,9 @@ GATE_JOB = """\
               echo "::error::  deferred: checks"
               echo "::error::  why: <what is staged, and why this is not broken>"
               echo "::error::  resolves: #<issue that clears it>"
-              echo "::error::at the start of a line, not inside a code fence or an HTML comment"
-              echo "::error::an unclosed fence or '<!--' earlier in the body hides everything after it"
+              echo "::error::at the start of a line, not inside a code fence or raw HTML"
+              echo "::error::an unclosed fence, or an unclosed '<!--', '<?', '<![CDATA[' or"
+              echo "::error::'<!DOCTYPE' earlier in the body, hides everything after it"
               exit 1 ;;
           esac
 """
@@ -323,8 +371,10 @@ def _readme(name: str, profile: Profile, process_id: str, ref: str) -> str:
     contexts = "\n".join(f"   - `{context}`" for context in REQUIRED_CONTEXTS)
 
     # A 40-character hash or a version tag is a pin; anything else is a moving
-    # ref, and the difference is the whole of CR-004 for this project.
-    pinned = bool(re.fullmatch(r"[0-9a-fA-F]{40}|v?[0-9].*", ref))
+    # ref, and the difference is the whole of CR-004 for this project. Deliberately
+    # narrow: `v?[0-9].*` called a branch named `2026-refactor` a pin, and telling
+    # someone their CI is reproducible when it is not is the wrong error to make.
+    pinned = bool(re.fullmatch(r"[0-9a-fA-F]{40}|v?[0-9]+(\.[0-9]+)*", ref))
     if pinned:
         ref_note = _wrap(
             f"pcbkit itself is pinned at `{ref}`, so this project's CI result "
@@ -419,11 +469,12 @@ Three lines, because each carries something a bare override label does not:
 which check, why, and what clears it. All three are required — an incomplete
 declaration fails the gate rather than passing it. Their order does not matter.
 
-Each must start at the beginning of a line, and **a block inside a code fence
-or an HTML comment does not count**. Otherwise a pull request that quoted this
-README would defer its own checks, and one that hid the block in a comment
-would defer them with nothing visible on the page — which is the quiet override
-the three lines exist to prevent.
+Each must start at the beginning of a line, and **a block inside a code fence,
+an HTML comment, or any other raw HTML that renders as nothing does not
+count**. Otherwise a pull request that quoted this README would defer its own
+checks, and one that hid the block in a comment would defer them with nothing
+visible on the page — which is the quiet override the three lines exist to
+prevent. The rule is what a reader sees on the pull request page.
 
 A deferral is tracked debt, not a pass. It stays visible in the pull request
 list, and a board that reaches an order with one unresolved is a board whose
@@ -516,6 +567,18 @@ def new_project(
             errors=[
                 f"invalid project name {name!r}: must start with a letter and "
                 "contain only letters, digits, hyphens, and underscores"
+            ],
+        )
+    # The name becomes `def {name}():` in the starter design, so a keyword
+    # scaffolds a project whose first build is a SyntaxError -- a gate that
+    # cannot pass, handed to the user at `pcbkit new` rather than in CI.
+    if keyword.iskeyword(name.replace("-", "_")):
+        return Envelope(
+            command="new",
+            ok=False,
+            errors=[
+                f"invalid project name {name!r}: it is a Python keyword, and "
+                "the name becomes a function in the starter design"
             ],
         )
     if not valid_ref(pcbkit_ref):

@@ -213,20 +213,38 @@ on the *opening* fence only, so a ```` ```js ```` line inside a ``` block is
 content: closing on it read the rest of a quoted document as live declarations,
 and a body pasting a chunk of markdown is precisely the case this exists for.
 
-HTML comments are scanned in order across the line, because a single line can
-close one comment and open another. Two independent line-level rules see only
-that the line contains both `<!--` and `-->`, and conclude the comment ended —
-so `<!-- note --> <!--` left everything below it live. That body renders as
-nothing at all: a pull request whose visible description is empty, deferring its
-own checks with a warning in a log nobody reads.
+A fence indented four spaces is not a fence but an indented code block, in
+either position. Anything looser is wrong in both directions: as a close it
+ended a fence CommonMark had not ended, so a body rendering wholly as a quoted
+example declared; as an open it started a fence CommonMark had not started,
+hiding a declaration a reader can plainly see.
 
-What survives that scan is what a reader sees, which is the actual rule. A
-declaration after a closed comment on the same line — `<!-- note -->deferred:
-checks` — *does* declare, because it renders. The one place the rule is
-enumerated rather than derived is `<details>`: a declaration inside one is taken,
-and it renders inside a collapsed disclosure. That is deliberate. A disclosure
-triangle is visible, the reader can open it, and the text is in the body
-permanently; a comment is none of those things.
+Raw HTML is scanned in order across the line, because a single line can close
+one span and open another. Two independent line-level rules see only that the
+line contains both `<!--` and `-->`, and conclude the comment ended — so
+`<!-- note --> <!--` left everything below it live, in a body that renders as
+nothing at all.
+
+And a comment is not the only thing that renders as nothing. CommonMark has
+four raw-HTML openers GitHub drops entirely — `<!--`, `<?`, `<![CDATA[`, and
+`<!` before a letter — each with its own terminator, and a declaration under any
+of them is invisible on the page. `<?php`, `<![CDATA[` and `<!DOCTYPE X` each
+rendered to the empty string while the gate read a complete deferral.
+
+What survives that scan is what a reader sees, which is the rule itself rather
+than a list of tags. It cuts both ways, and that is the check on it:
+
+- A declaration after a closed span on the same line — `<!-- note -->deferred:
+  checks` — *does* declare, because it renders.
+- `<!` before a digit, and a stray `-->` with no opener, are ordinary text.
+- A `<script>` block declares. GitHub escapes it and shows it; it does not hide
+  it. A tag-based rule would have guessed the other way.
+- `<details>` declares too. A disclosure triangle is visible, the reader can
+  open it, and the text is in the body permanently.
+
+Each verdict above was checked against GitHub's own renderer rather than
+against a reading of the specification, and the parser's table of cases runs
+under both `gawk` and `mawk` — `awk` on a hosted runner is `mawk`.
 
 An unbalanced fence, or a literal `<!--` with no closing `-->`, hides everything
 after it. That fails closed — the declaration below is not seen and the gate
@@ -287,8 +305,24 @@ against the registry rather than assumed.
 The container job runs as root. The image's own default user is `kicad`, uid
 1000, while a hosted runner owns the mounted workspace as uid 1001 — so
 `actions/checkout` cannot write it and the job dies before the first verb runs.
-That is the same class as the ref that did not resolve: a gate that cannot pass,
-found by reading the image config rather than by assuming it.
+
+And the tag is `-full`. The plain image ships no 3D-model library, `env.3dmodels`
+is a fail-severity check, and so `pcbkit doctor --strict` — the workflow's first
+step — exits 1 on a project nobody has touched. Every scaffolded repository
+would have got CI that was red before a circuit was written, and a required
+`gate` satisfiable only by deferring a check that was never broken.
+
+Both are the same class as the ref that did not resolve, and the same lesson
+three times: **resolving a name is not running the thing.** The tag existed, the
+image existed, and neither fact was the question. The confirmation recorded
+beside `KICAD_IMAGE` is now the emitted steps executed inside the image — 0
+model directories and step one exiting 1 on the plain tag, 105 and all three
+steps exiting 0 on `-full`.
+
+A unit test cannot reach inside a container without the network CR-003 keeps out
+of the suite, so what a test *can* do is run every emitted step against the
+scaffold locally. Two of the three were executed by nothing at all, which is how
+this reached a fourth review round.
 
 **pcbkit's own ref is the one place this milestone does not achieve CR-004, and
 it says so.** Pinning to `v<version>` would be correct, but pcbkit publishes no
@@ -308,7 +342,10 @@ one, in CI holding that project's secrets. `pcbkit new --pcbkit-ref 'main; curl
 a usage error, not something observed about a board (rule 3).
 
 The project name is validated the same way and for the same reason, since this
-change is what first routes it into a `run:` line.
+change is what first routes it into a `run:` line. It also may not be a Python
+keyword: the name becomes `def <name>():` in the starter design, so `pcbkit new
+--name class` scaffolded a project whose first build was a `SyntaxError` — a
+gate that cannot pass, handed to the user at creation rather than in CI.
 
 Both are matched with `re.fullmatch`. An anchored `re.match` is not equivalent:
 in Python `$` matches at the end of the string *or immediately before a trailing
@@ -352,7 +389,9 @@ rather than glossed over.
   complete `deferred:` block names it, in either field order. An incomplete
   block fails, and a block inside a code fence or an HTML comment does not
   declare anything — including a fence whose inner line carries an info string,
-  and a line that closes one comment and opens another.
+  a fence closed at four spaces of indent, a line that closes one comment and
+  opens another, and the raw-HTML openers `<?`, `<![CDATA[` and `<!DOCTYPE`,
+  each of which GitHub renders as nothing.
 - A comment whose last line is `VERDICT: APPROVE` and which names the head
   commit sets the `agent-review` status on that SHA; pushing a further commit
   clears it, and editing the old comment does not restore it.
