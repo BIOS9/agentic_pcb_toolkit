@@ -272,6 +272,11 @@ README states plainly that with the default, the project's CI result can change
 without the project changing. A documented limitation, not a silent one — and it
 closes the moment pcbkit tags a release.
 
+The ref is validated before it is written. It lands in a `run:` line, so a value
+that is not a ref would put a command in a workflow step that nobody wrote as
+one, in CI holding that project's secrets. `pcbkit new --pcbkit-ref 'main; curl
+…'` is refused with a finding, and nothing is written.
+
 The `gate` job is shared verbatim between this repository's workflow and every
 generated one, pinned by a test. Two copies of a rule are two rules, and the one
 nobody looks at is the one that rots.

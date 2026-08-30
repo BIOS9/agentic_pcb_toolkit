@@ -404,6 +404,16 @@ which a mistake starts costing money.
 
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
+# The ref is interpolated into a `run:` line of the generated workflow, so it
+# has to be a ref and not a command. A conservative subset of what git accepts:
+# anything outside it either is not a valid ref anyway or would turn a workflow
+# step into something its reader did not write.
+_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+
+def valid_ref(ref: str) -> bool:
+    return bool(_REF_RE.match(ref)) and ".." not in ref and not ref.endswith(".lock")
+
 
 def _starter_design(name: str) -> str:
     """A design file that builds immediately.
@@ -471,6 +481,17 @@ def new_project(
             errors=[
                 f"invalid project name {name!r}: must start with a letter and "
                 "contain only letters, digits, hyphens, and underscores"
+            ],
+        )
+    if not valid_ref(pcbkit_ref):
+        return Envelope(
+            command="new",
+            ok=False,
+            errors=[
+                f"invalid pcbkit ref {pcbkit_ref!r}: must be a git ref -- "
+                "letters, digits, and '._/-' only. It is written into a "
+                "workflow step, so anything else would put text there that "
+                "nobody wrote as a command."
             ],
         )
     if directory.exists() and any(directory.iterdir()):

